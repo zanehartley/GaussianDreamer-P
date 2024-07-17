@@ -24,6 +24,8 @@ import io
 from PIL import Image  
 import open3d as o3d
 
+from sklearn.preprocessing import MinMaxScaler
+
 
 def load_ply(path,save_path):
     C0 = 0.28209479177387814
@@ -104,6 +106,28 @@ class GaussianDreamer(BaseLift3DSystem):
             with open(output_file, 'wb') as file:  
                 file.write(writer.read())
     
+    def load_ply_and_get_data(self, filename):
+        # Load the PLY file using Open3D
+        point_cloud = o3d.io.read_point_cloud(filename)
+        
+        # Get coordinates from the point cloud
+        coords = np.asarray(point_cloud.points)
+        scaler = MinMaxScaler(feature_range=(-0.9, 0.9))  # Set the scaling range
+        coords = scaler.fit_transform(coords)
+
+        # Check if RGB color information exists
+        if point_cloud.has_colors():
+            rgb = np.asarray(point_cloud.colors)
+        else:
+            # Handle the case where no colors are present (return dummy values or None)
+            #rgb = np.zeros((coords.shape[0], 3))  # Example: fill with black (0, 0, 0)
+            green_values = np.random.rand(coords.shape[0]) * 0.5 + 0.25  # Random between 0.25 and 0.75
+            rgb = np.stack((0, green_values, 0), axis=-1)
+        # You can add additional logic here to handle other data in the PLY file (optional)
+
+        return coords, rgb, 0.4  # You can return additional data in the third slot
+
+
     def shape(self):
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -177,15 +201,16 @@ class GaussianDreamer(BaseLift3DSystem):
         for point in points:
             _, idx, _ = kdtree.search_knn_vector_3d(point, 1)
             nearest_point = np.asarray(pcd_by3d.points)[idx[0]]
-            if np.linalg.norm(point - nearest_point) < 0.01:  # 这个阈值可能需要调整
+            if np.linalg.norm(point - nearest_point) < 0.01 * 3:  # 这个阈值可能需要调整
                 points_inside.append(point)
                 color_inside.append(rgb[idx[0]]+0.2*np.random.random(3))
 
-                
-                
-
         all_coords = np.array(points_inside)
         all_rgb = np.array(color_inside)
+        #print("==================================================")
+        #print(f"all_coords: {all_coords.shape}")
+        #print(f"coords: {coords.shape}")
+        #print("==================================================")
         all_coords = np.concatenate([all_coords,coords],axis=0)
         all_rgb = np.concatenate([all_rgb,rgb],axis=0)
         return all_coords,all_rgb
@@ -212,13 +237,15 @@ class GaussianDreamer(BaseLift3DSystem):
             coords,rgb,scale = self.shape()
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
+        elif self.load_type==2:
+            filename = "./inputs/lewis.ply"
+            coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
         
         bound= self.radius*scale
-
-        all_coords,all_rgb = self.add_points(coords,rgb)
-        
+        #all_coords,all_rgb = self.add_points(coords,rgb)
+        all_coords,all_rgb = coords,rgb
 
         pcd = BasicPointCloud(points=all_coords *bound, colors=all_rgb, normals=np.zeros((all_coords.shape[0], 3)))
 
@@ -243,23 +270,16 @@ class GaussianDreamer(BaseLift3DSystem):
 
             
             if id == 0:
-
                 self.radii = radii
             else:
-
-
                 self.radii = torch.max(radii,self.radii)
                 
-            
             depth = render_pkg["depth_3dgs"]
             depth =  depth.permute(1, 2, 0)
             
             image =  image.permute(1, 2, 0)
             images.append(image)
             depths.append(depth)
-            
-
-
 
         images = torch.stack(images, 0)
         depths = torch.stack(depths, 0)
@@ -288,27 +308,30 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.gaussian.update_learning_rate(self.true_global_step)
 
+        #This step seems to render the image from the gaussian splat
         out = self(batch) 
 
         prompt_utils = self.prompt_processor()
+        #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
-
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
         
+        ########################## 2D Diffusion Step #############################
+        #This step seems to actually do the 2D diffusion and perhaps also the comparison to the real image.
         guidance_out = self.guidance(
             images, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
-        
+
+        #print("====================2D-DIFFUSION=======================")
+        #print(f"images: {type(images)}")
+        #print(f"guidance_out: {type(guidance_out)}")
+        #print("=======================================================")
 
         loss = 0.0
 
         loss = loss + guidance_out['loss_sds'] *self.C(self.cfg.loss['lambda_sds'])
-        
-
-
-
         
         loss_sparsity = (out["opacity"] ** 2 + 0.01).sqrt().mean()
         self.log("train/loss_sparsity", loss_sparsity)
@@ -326,12 +349,7 @@ class GaussianDreamer(BaseLift3DSystem):
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
 
-
-
-
         return {"loss": loss}
-
-
 
     def on_before_optimizer_step(self, optimizer):
 
@@ -349,11 +367,6 @@ class GaussianDreamer(BaseLift3DSystem):
                 if self.true_global_step > 300 and self.true_global_step % 100 == 0: # 500 100
                     size_threshold = 20 if self.true_global_step > 500 else None # 3000
                     self.gaussian.densify_and_prune(0.0002 , 0.05, self.cameras_extent, size_threshold) 
-
-
-
-
-
 
     def validation_step(self, batch, batch_idx):
         out = self(batch)
@@ -494,7 +507,6 @@ class GaussianDreamer(BaseLift3DSystem):
                 step=self.true_global_step,
             )
 
-
     def on_test_epoch_end(self):
         self.save_img_sequence(
             f"it{self.true_global_step}-test",
@@ -513,8 +525,6 @@ class GaussianDreamer(BaseLift3DSystem):
             self.save_gif_to_file(self.shapeimages, self.get_save_path("shape.gif"))
         load_ply(save_path,self.get_save_path(f"it{self.true_global_step}-test-color.ply"))
         
-
-
     def configure_optimizers(self):
         self.parser = ArgumentParser(description="Training script parameters")
         
