@@ -6,7 +6,11 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler, DDPMScheduler, StableDiffusionControlNetImg2ImgPipeline, ControlNetModel, UniPCMultistepScheduler
 from diffusers.utils.import_utils import is_xformers_available
 from tqdm import tqdm
+
 import numpy as np
+from PIL import Image
+from transformers import pipeline
+from torchvision.transforms.functional import to_pil_image
 
 import threestudio
 from threestudio.models.prompt_processors.base import PromptProcessorOutput
@@ -55,11 +59,12 @@ class ControlnetGuidance(BaseObject):
         self.weights_dtype = (
             torch.float16 if self.cfg.half_precision_weights else torch.float32
         )
-
+        
+        self.depth_estimator = pipeline("depth-estimation", model="Intel/dpt-large")
         self.controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
 
         pipe_kwargs = {
-            "tokenizer": None,
+            "tokenizer": None, 
             "controlnet": self.controlnet,
             "safety_checker": None,
             "feature_extractor": None,
@@ -154,12 +159,16 @@ class ControlnetGuidance(BaseObject):
         latents: Float[Tensor, "..."],
         t: Float[Tensor, "..."],
         encoder_hidden_states: Float[Tensor, "..."],
+        down_block_additional_residuals: Float[Tensor, "..."], 
+        mid_block_additional_residual: Float[Tensor, "..."],
     ) -> Float[Tensor, "..."]:
         input_dtype = latents.dtype
         return self.unet(
             latents.to(self.weights_dtype),
             t.to(self.weights_dtype),
             encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+                down_block_additional_residuals=down_block_additional_residuals, 
+                mid_block_additional_residual=mid_block_additional_residual,
         ).sample.to(input_dtype)
 
     @torch.cuda.amp.autocast(enabled=False)
@@ -187,15 +196,36 @@ class ControlnetGuidance(BaseObject):
         image = self.vae.decode(latents.to(self.weights_dtype)).sample
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
-    
-    def get_depth_map(image, depth_estimator):
-        image = depth_estimator(image)["depth"]
-        image = np.array(image)
-        image = image[:, :, None]
-        image = np.concatenate([image, image, image], axis=2)
-        detected_map = torch.from_numpy(image).float() / 255.0
-        depth_map = detected_map.permute(2, 0, 1)
-        return depth_map
+        
+    def get_depth_map(self, image_batch, depth_estimator):
+        # Move channel dimension to the last position if necessary (NHWC -> NCHW)
+        if image_batch.dim() == 4 and image_batch.shape[1] == 3:
+            image_batch = image_batch.permute(0, 3, 1, 2)
+        elif image_batch.dim() == 3:
+            image_batch = image_batch.unsqueeze(0)
+        # Convert tensors to PIL images (assuming CHW format)
+        depth_maps = []
+        for img in image_batch:
+            img_np = img.cpu().numpy()
+            img_np = img_np * 255
+            img_np = img_np.astype(np.uint8)
+            image = Image.fromarray(img_np)
+            dp = depth_estimator(image)["depth"]
+            dp = np.array(dp)
+            dp = dp[:, :, None]
+            dp = np.concatenate([dp, dp, dp], axis=2)
+            depth_tensor = torch.from_numpy(np.array(dp)[None]).float()
+            depth_tensor = depth_tensor.squeeze().permute(2, 0, 1)
+            if depth_tensor.dim() == 3:
+                depth_tensor = depth_tensor.unsqueeze(0)  # Add channel dimension (if needed)
+            depth_maps.append(depth_tensor)
+
+        # Concatenate depth maps along the batch dimension (axis=0)
+        depth_maps_tensor = torch.cat(depth_maps, dim=0)
+        #print(f"depth_maps_tensor: {depth_maps_tensor.shape}")
+
+        return depth_maps_tensor
+
 
     def compute_grad_sds(
         self,
@@ -222,6 +252,8 @@ class ControlnetGuidance(BaseObject):
                 latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
 
                 depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
+
+                #print(f"256 - Latent model input: {latent_model_input.size()}")
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     latent_model_input,
@@ -267,10 +299,27 @@ class ControlnetGuidance(BaseObject):
                 latents_noisy = self.scheduler.add_noise(latents, noise, t)
                 # pred noise
                 latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+
+                depth_map = self.get_depth_map(images, self.depth_estimator).to(self.device).half()
+                depth_map = torch.cat([depth_map] * 2, dim=0)
+
+                #print(f"304 - Latent model input: {latent_model_input.size()}")
+                #print(f"30x - Depth map size: {depth_map.size()}")
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    torch.cat([t] * 2),
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    return_dict=False,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 2),
                     encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample
                 )
 
             # perform guidance (high scale from paper!)
@@ -298,6 +347,7 @@ class ControlnetGuidance(BaseObject):
             "neg_guidance_weights": neg_guidance_weights,
             "text_embeddings": text_embeddings,
             "t_orig": t,
+            "images": images,
             "latents_noisy": latents_noisy,
             "noise_pred": noise_pred,
         }
@@ -307,6 +357,7 @@ class ControlnetGuidance(BaseObject):
     def compute_grad_sjc(
         self,
         latents: Float[Tensor, "B 4 64 64"],
+        images: Float[Tensor, "B H W C"],
         t: Int[Tensor, "B"],
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
@@ -332,10 +383,25 @@ class ControlnetGuidance(BaseObject):
                 scaled_zs = zs / torch.sqrt(1 + sigma**2)
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 4, dim=0)
+
+                depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
+
+                #print(f"388 - Latent model input: {latent_model_input.size()}")
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    return_dict=False,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 4),
                     encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample
                 )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -370,10 +436,25 @@ class ControlnetGuidance(BaseObject):
 
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 2, dim=0)
+
+                depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
+
+                #print(f"439 - Latent model input: {latent_model_input.size()}")
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    return_dict=False,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 2),
                     encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample
                 )
 
                 # perform guidance (high scale from paper!)
@@ -439,7 +520,7 @@ class ControlnetGuidance(BaseObject):
 
         if self.cfg.use_sjc:
             grad, guidance_eval_utils = self.compute_grad_sjc(
-                latents, t, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, t, prompt_utils, elevation, azimuth, camera_distances
             )
         else:
             grad, guidance_eval_utils = self.compute_grad_sds(
@@ -483,21 +564,36 @@ class ControlnetGuidance(BaseObject):
     def get_noise_pred(
         self,
         latents_noisy,
+        image,
         t,
         text_embeddings,
         use_perp_neg=False,
         neg_guidance_weights=None,
     ):
         batch_size = latents_noisy.shape[0]
-        
 
         if use_perp_neg:
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
+
+            depth_map = self.get_depth_map(image, self.depth_estimator).unsqueeze(0).to(self.device).half()
+
+            #print(f"576 - Latent model input: {latent_model_input.size()}")
+
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    return_dict=False,
+                )
+
             noise_pred = self.forward_unet(
                 latent_model_input,
                 torch.cat([t.reshape(1)] * 4).to(self.device),
                 encoder_hidden_states=text_embeddings,
+                down_block_additional_residuals=down_block_res_samples, 
+                mid_block_additional_residual=mid_block_res_sample
             )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -519,10 +615,32 @@ class ControlnetGuidance(BaseObject):
         else:
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+
+            #print("Gets here 1")
+            depth_map = self.get_depth_map(image, self.depth_estimator).to(self.device).half()
+            #print("Gets here 2")
+
+            #print(f"latent_model_input shape: {latent_model_input.size()}")
+            #print(f"depth_map shape: {depth_map.size()}")
+            
+            latent_model_input  = latent_model_input.to(torch.float16)
+            text_embeddings  = text_embeddings.to(torch.float16)
+            #print(f"621 - Latent model input: {latent_model_input.size()}")
+
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    return_dict=False,
+                )
+
             noise_pred = self.forward_unet(
                 latent_model_input,
                 torch.cat([t.reshape(1)] * 2).to(self.device),
                 encoder_hidden_states=text_embeddings,
+                down_block_additional_residuals=down_block_res_samples, 
+                mid_block_additional_residual=mid_block_res_sample
             )
             # perform guidance (high scale from paper!)
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
@@ -538,6 +656,7 @@ class ControlnetGuidance(BaseObject):
         self,
         t_orig,
         text_embeddings,
+        images,
         latents_noisy,
         noise_pred,
         use_perp_neg=False,
@@ -590,7 +709,7 @@ class ControlnetGuidance(BaseObject):
             for t in tqdm(self.scheduler.timesteps[i + 1 :], leave=False):
                 # pred noise
                 noise_pred = self.get_noise_pred(
-                    latents, t, text_emb, use_perp_neg, neg_guid
+                    latents, images[b], t, text_emb, use_perp_neg, neg_guid
                 )
                 # get prev latent
                 latents = self.scheduler.step(noise_pred, t, latents, eta=1)[

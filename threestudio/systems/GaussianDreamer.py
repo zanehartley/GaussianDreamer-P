@@ -96,7 +96,6 @@ class GaussianDreamer(BaseLift3DSystem):
         bg_color = [1, 1, 1] if False else [0, 0, 0]
         self.background_tensor = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    
     def save_gif_to_file(self,images, output_file):  
         with io.BytesIO() as writer:  
             images[0].save(  
@@ -122,7 +121,8 @@ class GaussianDreamer(BaseLift3DSystem):
             # Handle the case where no colors are present (return dummy values or None)
             #rgb = np.zeros((coords.shape[0], 3))  # Example: fill with black (0, 0, 0)
             green_values = np.random.rand(coords.shape[0]) * 0.5 + 0.25  # Random between 0.25 and 0.75
-            rgb = np.stack((0, green_values, 0), axis=-1)
+            zeros_array = np.zeros(green_values.shape)
+            rgb = np.stack((zeros_array, green_values, zeros_array), axis=-1)
         # You can add additional logic here to handle other data in the PLY file (optional)
 
         return coords, rgb, 0.4  # You can return additional data in the third slot
@@ -238,7 +238,7 @@ class GaussianDreamer(BaseLift3DSystem):
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
         elif self.load_type==2:
-            filename = "./inputs/lewis.ply"
+            filename = "./inputs/subdivide_twice.ply"
             coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
@@ -300,6 +300,8 @@ class GaussianDreamer(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
     
     def training_step(self, batch, batch_idx):
+        batch["height"] = 512
+        batch["width"] = 512
 
         self.gaussian.update_learning_rate(self.true_global_step)
         
@@ -309,11 +311,13 @@ class GaussianDreamer(BaseLift3DSystem):
         self.gaussian.update_learning_rate(self.true_global_step)
 
         #This step seems to render the image from the gaussian splat
+        #print(f"BATCH SIZE: {batch['height']} and {batch['width']}")
         out = self(batch) 
 
         prompt_utils = self.prompt_processor()
         #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
+        #print(f"IN THE MAIN CLASS IMAGE SIZE: {images.size()}")
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False

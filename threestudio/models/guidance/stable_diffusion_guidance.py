@@ -395,6 +395,7 @@ class StableDiffusionGuidance(BaseObject):
                 rgb_BCHW, (512, 512), mode="bilinear", align_corners=False
             )
             # encode image into latents with vae
+            print(f"rgb_BCHW_512: {rgb_BCHW_512.size()}")
             latents = self.encode_images(rgb_BCHW_512)
 
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
