@@ -207,10 +207,6 @@ class GaussianDreamer(BaseLift3DSystem):
 
         all_coords = np.array(points_inside)
         all_rgb = np.array(color_inside)
-        #print("==================================================")
-        #print(f"all_coords: {all_coords.shape}")
-        #print(f"coords: {coords.shape}")
-        #print("==================================================")
         all_coords = np.concatenate([all_coords,coords],axis=0)
         all_rgb = np.concatenate([all_rgb,rgb],axis=0)
         return all_coords,all_rgb
@@ -238,7 +234,7 @@ class GaussianDreamer(BaseLift3DSystem):
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
         elif self.load_type==2:
-            filename = "./inputs/subdivide_twice.ply"
+            filename = "./inputs/lewis.ply"
             coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
@@ -300,8 +296,10 @@ class GaussianDreamer(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
     
     def training_step(self, batch, batch_idx):
-        batch["height"] = 512
-        batch["width"] = 512
+        batch["height"] = 1024
+        batch["width"] = 1024
+
+        #print(batch.keys())
 
         self.gaussian.update_learning_rate(self.true_global_step)
         
@@ -311,13 +309,13 @@ class GaussianDreamer(BaseLift3DSystem):
         self.gaussian.update_learning_rate(self.true_global_step)
 
         #This step seems to render the image from the gaussian splat
-        #print(f"BATCH SIZE: {batch['height']} and {batch['width']}")
         out = self(batch) 
 
         prompt_utils = self.prompt_processor()
         #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
-        #print(f"IN THE MAIN CLASS IMAGE SIZE: {images.size()}")
+        depths = out["depth"]
+        
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
@@ -325,13 +323,9 @@ class GaussianDreamer(BaseLift3DSystem):
         ########################## 2D Diffusion Step #############################
         #This step seems to actually do the 2D diffusion and perhaps also the comparison to the real image.
         guidance_out = self.guidance(
-            images, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
+            images, depths, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
 
-        #print("====================2D-DIFFUSION=======================")
-        #print(f"images: {type(images)}")
-        #print(f"guidance_out: {type(guidance_out)}")
-        #print("=======================================================")
 
         loss = 0.0
 
