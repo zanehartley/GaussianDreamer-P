@@ -871,6 +871,7 @@ def conv_attn_to_linear(checkpoint):
 def convert_from_original_zero123_ckpt(
     checkpoint_path, original_config_file, extract_ema, device
 ):
+    print("THIS LINE OF CODE RUNS")
     ckpt = torch.load(checkpoint_path, map_location=device)
     global_step = ckpt["global_step"]
     checkpoint = ckpt["state_dict"]

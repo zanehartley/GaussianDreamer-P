@@ -57,12 +57,12 @@ def pose_spherical(theta, phi, radius):
 class RandomCameraDataModuleConfig:
     # height, width, and batch_size should be Union[int, List[int]]
     # but OmegaConf does not support Union of containers
-    height: Any = 512
-    width: Any = 512
+    height: Any = 1024
+    width: Any = 1024
     batch_size: Any = 1
     resolution_milestones: List[int] = field(default_factory=lambda: [])
-    eval_height: int = 512
-    eval_width: int = 512
+    eval_height: int = 1024
+    eval_width: int = 1024
     eval_batch_size: int = 1
     n_val_views: int = 1
     n_test_views: int = 120
