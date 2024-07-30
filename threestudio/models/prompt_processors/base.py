@@ -57,7 +57,6 @@ class PromptProcessorOutput:
     ) -> Float[Tensor, "BB N Nf"]:
         batch_size = elevation.shape[0]
 
-        print(f"view_dependent_prompting: {view_dependent_prompting}")
         if view_dependent_prompting:
             # Get direction
             direction_idx = torch.zeros_like(elevation, dtype=torch.long)
@@ -416,7 +415,6 @@ class PromptProcessor(BaseObject):
         return torch.load(cache_path, map_location=self.device)
 
     def preprocess_prompt(self, prompt: str) -> str:
-        print(f"PREPROCESSING PROMPT: {prompt}")
         if prompt.startswith("lib:"):
             # find matches in the library
             candidate = None

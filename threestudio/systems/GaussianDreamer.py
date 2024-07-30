@@ -129,7 +129,7 @@ class GaussianDreamer(BaseLift3DSystem):
 
 
     def shape(self):
-
+        print("THIS USELESS FUNCTION RUNS")
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         xm = load_model('transmitter', device=device)
         model = load_model('text300M', device=device)
@@ -296,8 +296,8 @@ class GaussianDreamer(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
     
     def training_step(self, batch, batch_idx):
-        batch["height"] = 1024
-        batch["width"] = 1024
+        batch["height"] = 768
+        batch["width"] = 768
 
         #print(batch.keys())
 
@@ -319,11 +319,15 @@ class GaussianDreamer(BaseLift3DSystem):
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
+
+
+        prompt = self.cfg.prompt_processor.prompt
+        negative_prompt = self.cfg.prompt_processor.negative_prompt
         
         ########################## 2D Diffusion Step #############################
         #This step seems to actually do the 2D diffusion and perhaps also the comparison to the real image.
         guidance_out = self.guidance(
-            images, depths, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
+            images, depths, prompt, negative_prompt, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
 
 

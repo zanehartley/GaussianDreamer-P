@@ -61,29 +61,26 @@ class ControlnetGuidance(BaseObject):
         )
         
         #self.depth_estimator = pipeline("depth-estimation", model="Intel/dpt-large")
-        self.vae  = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
         #self.controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
         self.controlnet_conditioning_scale = 0.5
-        self.controlnet = ControlNetModel.from_pretrained("diffusers/controlnet-depth-sdxl-1.0", torch_dtype=torch.float16, addition_embed_type=None)
+        self.controlnet = ControlNetModel.from_pretrained("diffusers/controlnet-depth-sdxl-1.0-small", variant="fp16", torch_dtype=torch.float16, use_safetensors=True, addition_embed_type=None)
+        self.vae  = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
 
         pipe_kwargs = {
-            "tokenizer": None, 
-            "vae": self.vae,
             "controlnet": self.controlnet,
+            "vae": self.vae,
+            "variant": "fp16",
+            "use_safetensors": True,
+            "torch_dtype": self.weights_dtype,
             "safety_checker": None,
             "feature_extractor": None,
             "requires_safety_checker": False,
-            "torch_dtype": self.weights_dtype,
         }
-
-
 
         self.pipe = StableDiffusionXLControlNetImg2ImgPipeline.from_pretrained(
             self.cfg.pretrained_model_name_or_path,
             **pipe_kwargs,
         ).to(self.device)
-
-
 
         if self.cfg.enable_memory_efficient_attention:
             if parse_version(torch.__version__) >= parse_version("2"):
@@ -106,7 +103,7 @@ class ControlnetGuidance(BaseObject):
         if self.cfg.enable_channels_last_format:
             self.pipe.unet.to(memory_format=torch.channels_last)
 
-        del self.pipe.text_encoder
+        #del self.pipe.text_encoder
         cleanup()
 
         # Create model
@@ -167,19 +164,21 @@ class ControlnetGuidance(BaseObject):
         encoder_hidden_states: Float[Tensor, "..."],
         down_block_additional_residuals: Float[Tensor, "..."], 
         mid_block_additional_residual: Float[Tensor, "..."],
+        added_cond_kwargs: Dict
     ) -> Float[Tensor, "..."]:
         input_dtype = latents.dtype
         return self.unet(
             latents.to(self.weights_dtype),
             t.to(self.weights_dtype),
             encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-                down_block_additional_residuals=down_block_additional_residuals, 
-                mid_block_additional_residual=mid_block_additional_residual,
+            down_block_additional_residuals=down_block_additional_residuals, 
+            mid_block_additional_residual=mid_block_additional_residual,
+            added_cond_kwargs=added_cond_kwargs,
         ).sample.to(input_dtype)
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_images(
-        self, imgs: Float[Tensor, "B 3 1024 1024"]
+        self, imgs: Float[Tensor, "B 3 768 768"]
     ) -> Float[Tensor, "B 4 64 64"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
@@ -193,7 +192,7 @@ class ControlnetGuidance(BaseObject):
         latents: Float[Tensor, "B 4 H W"],
         latent_height: int = 64,
         latent_width: int = 64,
-    ) -> Float[Tensor, "B 3 1024 1024"]:
+    ) -> Float[Tensor, "B 3 768 768"]:
         input_dtype = latents.dtype
         latents = F.interpolate(
             latents, (latent_height, latent_width), mode="bilinear", align_corners=False
@@ -235,17 +234,17 @@ class ControlnetGuidance(BaseObject):
     def compute_grad_sds(
         self,
         latents: Float[Tensor, "B 4 64 64"],
-        depths: Float[Tensor, "B 4 1024 1024"],
+        depths: Float[Tensor, "B 4 768 768"],
         images: Float[Tensor, "B H W C"],
         t: Int[Tensor, "B"],
+        prompt: str,
+        negative_prompt: str,
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
         azimuth: Float[Tensor, "B"],
         camera_distances: Float[Tensor, "B"],
     ):
         batch_size = elevation.shape[0]
-
-        print(f"prompt_utils.use_perp_neg: {prompt_utils.use_perp_neg}")
 
         if prompt_utils.use_perp_neg:
             (
@@ -261,15 +260,15 @@ class ControlnetGuidance(BaseObject):
 
                 #depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
                 depth_map = depths
-                print(depths.size())
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     sample=latent_model_input,
                     timestep=t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
                 noise_pred = self.forward_unet(
@@ -277,7 +276,8 @@ class ControlnetGuidance(BaseObject):
                     torch.cat([t] * 4),
                     encoder_hidden_states=text_embeddings, 
                     down_block_additional_residuals=down_block_res_samples, 
-                    mid_block_additional_residual=mid_block_res_sample
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=added_cond_kwargs,
                 )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -301,7 +301,6 @@ class ControlnetGuidance(BaseObject):
             text_embeddings = prompt_utils.get_text_embeddings(
                 elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
             )
-            print(text_embeddings.size())
             # predict the noise residual with unet, NO grad!
             with torch.no_grad():
                 # add noise
@@ -314,25 +313,88 @@ class ControlnetGuidance(BaseObject):
                 depth_map = depths.permute(0, 3, 1, 2)
                 depth_map = torch.cat([depth_map] * 2, dim=0)
 
-                print(f"latent_model_input: {latent_model_input.size()}")
-                print(f"text_embeddings: {text_embeddings.size()}")
-                print(f"depth_map: {depth_map.size()}")
+
+                #============================================================================================
+
+                prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+                    prompt=prompt,
+                    device='cuda:0',
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                    negative_prompt=negative_prompt
+                    )
+
+                text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+                original_size = (1024, 1024)
+                target_size = (1024, 1024)
+                (height, width) = (1024, 1024)
+                crops_coords_top_left = (0,0)
+                negative_crops_coords_top_left = (0,0)
+                aesthetic_score = 6
+                negative_aesthetic_score = 2.5
+                
+                if isinstance(depths, list):
+                    original_size = original_size or depths[0].shape[-2:]
+                else:
+                    original_size = original_size or depths.shape[-2:]
+                target_size = target_size or (height, width)
+
+                negative_original_size = original_size
+                negative_target_size = target_size
+                add_text_embeds = pooled_prompt_embeds
+
+                if self.pipe.text_encoder_2 is None:
+                    text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+                else:
+                    text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+                add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+                    original_size,
+                    crops_coords_top_left,
+                    target_size,
+                    aesthetic_score,
+                    negative_aesthetic_score,
+                    negative_original_size,
+                    negative_crops_coords_top_left,
+                    negative_target_size,
+                    dtype=text_embeddings.dtype,
+                    text_encoder_projection_dim=text_encoder_projection_dim,
+                )
+
+                add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
+
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+                add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+                add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
+                add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+                prompt_embeds = prompt_embeds.to(self.device)
+                add_text_embeds = add_text_embeds.to(self.device)
+                add_time_ids = add_time_ids.to(self.device)
+
+
+                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+                #============================================================================================
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     latent_model_input,
                     torch.cat([t] * 2),
-                    encoder_hidden_states=text_embeddings,
+                    encoder_hidden_states=prompt_embeds,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 2),
-                    encoder_hidden_states=text_embeddings,
+                    encoder_hidden_states=prompt_embeds,
                     down_block_additional_residuals=down_block_res_samples, 
-                    mid_block_additional_residual=mid_block_res_sample
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
             # perform guidance (high scale from paper!)
@@ -356,6 +418,8 @@ class ControlnetGuidance(BaseObject):
         grad = w * (noise_pred - noise)
 
         guidance_eval_utils = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
             "use_perp_neg": prompt_utils.use_perp_neg,
             "neg_guidance_weights": neg_guidance_weights,
             "text_embeddings": text_embeddings,
@@ -374,6 +438,8 @@ class ControlnetGuidance(BaseObject):
         images: Float[Tensor, "B H W C"],
         depths: Float[Tensor, "B H W C"],
         t: Int[Tensor, "B"],
+        prompt: str,
+        negative_prompt: str,
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
         azimuth: Float[Tensor, "B"],
@@ -401,15 +467,15 @@ class ControlnetGuidance(BaseObject):
 
                 #depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
                 depth_map = depths
-                print(depths.size())
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
                 noise_pred = self.forward_unet(
@@ -417,7 +483,8 @@ class ControlnetGuidance(BaseObject):
                     torch.cat([t] * 4),
                     encoder_hidden_states=text_embeddings,
                     down_block_additional_residuals=down_block_res_samples, 
-                    mid_block_additional_residual=mid_block_res_sample
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=added_cond_kwargs,
                 )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -461,8 +528,9 @@ class ControlnetGuidance(BaseObject):
                     t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
                 noise_pred = self.forward_unet(
@@ -470,7 +538,8 @@ class ControlnetGuidance(BaseObject):
                     torch.cat([t] * 2),
                     encoder_hidden_states=text_embeddings,
                     down_block_additional_residuals=down_block_res_samples, 
-                    mid_block_additional_residual=mid_block_res_sample
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
                 # perform guidance (high scale from paper!)
@@ -487,6 +556,8 @@ class ControlnetGuidance(BaseObject):
             grad = -(Ds - zs) / sigma
 
         guidance_eval_utils = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt,
             "use_perp_neg": prompt_utils.use_perp_neg,
             "neg_guidance_weights": neg_guidance_weights,
             "text_embeddings": text_embeddings,
@@ -502,6 +573,8 @@ class ControlnetGuidance(BaseObject):
         self,
         rgb: Float[Tensor, "B H W C"],
         depth: Float[Tensor, "B H W C"],
+        prompt: str,
+        negative_prompt: str,
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
         azimuth: Float[Tensor, "B"],
@@ -510,10 +583,64 @@ class ControlnetGuidance(BaseObject):
         guidance_eval=False,
         **kwargs,
     ):
-        batch_size = rgb.shape[0]
+        
+#====================== Prepare the prompt =============================
 
-        depth = depth.to(torch.float16)
+        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+        prompt=prompt,
+        device='cuda:0',
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=True,
+        negative_prompt=negative_prompt
+        )
 
+        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+        self.batch_size = rgb.shape[0]
+
+        #depth = depth.to(torch.float16)
+
+#====================== Prepare the Controlnet Image =============================
+
+        control_image = self.pipe.prepare_control_image(
+            image=depth,
+            width = 768,
+            height= 768,
+            batch_size= self.batch_size,
+            num_images_per_prompt= 1,
+            device=self.device,
+            dtype=self.controlnet.dtype,
+            do_classifier_free_guidance=True,
+            guess_mode=False,
+        )
+
+
+#====================== Prepare the Timestep =====================================
+
+        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
+        t = torch.randint(
+            self.min_step,
+            self.max_step + 1,
+            [self.batch_size],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+#======================= Prepare latents =======================
+
+        rgb_BCHW = rgb.permute(0, 3, 1, 2).half()
+        latents = self.pipe.prepare_latents(
+            rgb_BCHW,
+            t,
+            self.batch_size,
+            1,
+            prompt_embeds.dtype,
+            self.device,
+            None,
+            True,
+        )
+        
+        '''
         rgb_BCHW = rgb.permute(0, 3, 1, 2)
         latents: Float[Tensor, "B 4 64 64"]
         if rgb_as_latents:
@@ -522,27 +649,20 @@ class ControlnetGuidance(BaseObject):
             )
         else:
             rgb_BCHW_512 = F.interpolate(
-                rgb_BCHW, (1024, 1024), mode="bilinear", align_corners=False
+                rgb_BCHW, (768, 768), mode="bilinear", align_corners=False
             )
             # encode image into latents with vae
-            latents = self.encode_images(rgb_BCHW_512)
+            latents = self.encode_images(rgb_BCHW_512)     
+        '''
 
-        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(
-            self.min_step,
-            self.max_step + 1,
-            [batch_size],
-            dtype=torch.long,
-            device=self.device,
-        )
 
         if self.cfg.use_sjc:
             grad, guidance_eval_utils = self.compute_grad_sjc(
-                latents, rgb, depth, t, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, depth, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
             )
         else:
             grad, guidance_eval_utils = self.compute_grad_sds(
-                latents, rgb, depth, t, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, depth, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
             )
 
         grad = torch.nan_to_num(grad)
@@ -554,7 +674,7 @@ class ControlnetGuidance(BaseObject):
         # SpecifyGradient is not straghtforward, use a reparameterization trick instead
         target = (latents - grad).detach()
         # d(loss)/d(latents) = latents - target = latents - (latents - grad) = grad
-        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / batch_size
+        loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / self.batch_size
 
         guidance_out = {
             "loss_sds": loss_sds,
@@ -586,11 +706,77 @@ class ControlnetGuidance(BaseObject):
         image,
         depth,
         t,
+        prompt,
+        negative_prompt,
         text_embeddings,
         use_perp_neg=False,
         neg_guidance_weights=None,
     ):
         batch_size = latents_noisy.shape[0]
+
+        #============================================================================================
+
+        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+            prompt=prompt,
+            device='cuda:0',
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompt
+            )
+
+        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+        original_size = (1024, 1024)
+        target_size = (1024, 1024)
+        (height, width) = (1024, 1024)
+        crops_coords_top_left = (0,0)
+        negative_crops_coords_top_left = (0,0)
+        aesthetic_score = 6
+        negative_aesthetic_score = 2.5
+        
+        if isinstance(depth, list):
+            original_size = original_size or depth[0].shape[-2:]
+        else:
+            original_size = original_size or depth.shape[-2:]
+        target_size = target_size or (height, width)
+
+        negative_original_size = original_size
+        negative_target_size = target_size
+        add_text_embeds = pooled_prompt_embeds
+
+        if self.pipe.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+            original_size,
+            crops_coords_top_left,
+            target_size,
+            aesthetic_score,
+            negative_aesthetic_score,
+            negative_original_size,
+            negative_crops_coords_top_left,
+            negative_target_size,
+            dtype=text_embeddings.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+
+        add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
+
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
+        add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds = prompt_embeds.to(self.device)
+        add_text_embeds = add_text_embeds.to(self.device)
+        add_time_ids = add_time_ids.to(self.device)
+
+
+        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+        #============================================================================================
 
         if use_perp_neg:
             # pred noise
@@ -604,8 +790,9 @@ class ControlnetGuidance(BaseObject):
                     t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
             noise_pred = self.forward_unet(
@@ -613,7 +800,8 @@ class ControlnetGuidance(BaseObject):
                 torch.cat([t.reshape(1)] * 4).to(self.device),
                 encoder_hidden_states=text_embeddings,
                 down_block_additional_residuals=down_block_res_samples, 
-                mid_block_additional_residual=mid_block_res_sample
+                mid_block_additional_residual=mid_block_res_sample,
+                added_cond_kwargs=added_cond_kwargs,
             )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -650,8 +838,9 @@ class ControlnetGuidance(BaseObject):
                     t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = 1.0,
                     return_dict=False,
-                    added_cond_kwargs={},
+                    added_cond_kwargs=added_cond_kwargs,
                 )
 
             noise_pred = self.forward_unet(
@@ -659,7 +848,8 @@ class ControlnetGuidance(BaseObject):
                 torch.cat([t.reshape(1)] * 2).to(self.device),
                 encoder_hidden_states=text_embeddings,
                 down_block_additional_residuals=down_block_res_samples, 
-                mid_block_additional_residual=mid_block_res_sample
+                mid_block_additional_residual=mid_block_res_sample,
+                added_cond_kwargs=added_cond_kwargs,
             )
             # perform guidance (high scale from paper!)
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
@@ -673,6 +863,8 @@ class ControlnetGuidance(BaseObject):
     @torch.no_grad()
     def guidance_eval(
         self,
+        prompt,
+        negative_prompt,
         t_orig,
         text_embeddings,
         images,
@@ -729,7 +921,7 @@ class ControlnetGuidance(BaseObject):
             for t in tqdm(self.scheduler.timesteps[i + 1 :], leave=False):
                 # pred noise
                 noise_pred = self.get_noise_pred(
-                    latents, images[b], depth[b], t, text_emb, use_perp_neg, neg_guid
+                    latents, images[b], depth[b], t, prompt, negative_prompt, text_emb, use_perp_neg, neg_guid
                 )
                 # get prev latent
                 latents = self.scheduler.step(noise_pred, t, latents, eta=1)[
