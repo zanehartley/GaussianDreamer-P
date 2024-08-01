@@ -307,6 +307,7 @@ class SaverMixin:
         step: Optional[int] = None,
         texts: Optional[List[float]] = None,
     ):
+        print("Saving the image grid")
         save_path = self.get_save_path(filename)
         img = self.get_image_grid_(imgs, align=align)
 

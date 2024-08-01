@@ -280,6 +280,9 @@ class GaussianDreamer(BaseLift3DSystem):
         images = torch.stack(images, 0)
         depths = torch.stack(depths, 0)
         self.visibility_filter = self.radii>0.0
+
+        depths = depths.repeat(1, 1, 1, 3)
+
         render_pkg["comp_rgb"] = images
         render_pkg["depth"] = depths
         render_pkg["opacity"] = depths / (depths.max() + 1e-5)
@@ -299,8 +302,6 @@ class GaussianDreamer(BaseLift3DSystem):
         batch["height"] = 768
         batch["width"] = 768
 
-        #print(batch.keys())
-
         self.gaussian.update_learning_rate(self.true_global_step)
         
         if self.true_global_step > 500:
@@ -316,10 +317,8 @@ class GaussianDreamer(BaseLift3DSystem):
         images = out["comp_rgb"]
         depths = out["depth"]
         
-
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
-
 
         prompt = self.cfg.prompt_processor.prompt
         negative_prompt = self.cfg.prompt_processor.negative_prompt
@@ -329,7 +328,6 @@ class GaussianDreamer(BaseLift3DSystem):
         guidance_out = self.guidance(
             images, depths, prompt, negative_prompt, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
-
 
         loss = 0.0
 

@@ -234,8 +234,8 @@ class ControlnetGuidance(BaseObject):
     def compute_grad_sds(
         self,
         latents: Float[Tensor, "B 4 64 64"],
-        depths: Float[Tensor, "B 4 768 768"],
         images: Float[Tensor, "B H W C"],
+        depths: Float[Tensor, "B 4 768 768"],
         t: Int[Tensor, "B"],
         prompt: str,
         negative_prompt: str,
@@ -245,6 +245,69 @@ class ControlnetGuidance(BaseObject):
         camera_distances: Float[Tensor, "B"],
     ):
         batch_size = elevation.shape[0]
+
+        #============================================================================================
+        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+            prompt=prompt,
+            device='cuda:0',
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompt
+            )
+
+        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+        original_size = (768, 768)
+        target_size = (768, 768)
+        (height, width) = (768, 768)
+        crops_coords_top_left = (0,0)
+        negative_crops_coords_top_left = (0,0)
+        aesthetic_score = 6
+        negative_aesthetic_score = 2.5
+        
+        if isinstance(depths, list):
+            original_size = original_size or depths[0].shape[-2:]
+        else:
+            original_size = original_size or depths.shape[-2:]
+        target_size = target_size or (height, width)
+
+        negative_original_size = original_size
+        negative_target_size = target_size
+        add_text_embeds = pooled_prompt_embeds
+
+        if self.pipe.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+            original_size,
+            crops_coords_top_left,
+            target_size,
+            aesthetic_score,
+            negative_aesthetic_score,
+            negative_original_size,
+            negative_crops_coords_top_left,
+            negative_target_size,
+            dtype=text_embeddings.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+
+        add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
+
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
+        add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds = prompt_embeds.to(self.device)
+        add_text_embeds = add_text_embeds.to(self.device)
+        add_time_ids = add_time_ids.to(self.device)
+
+
+        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+        #============================================================================================
 
         if prompt_utils.use_perp_neg:
             (
@@ -258,14 +321,11 @@ class ControlnetGuidance(BaseObject):
                 latents_noisy = self.scheduler.add_noise(latents, noise, t)
                 latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
 
-                #depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
-                depth_map = depths
-
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     sample=latent_model_input,
                     timestep=t,
                     encoder_hidden_states=text_embeddings,
-                    controlnet_cond=depth_map,
+                    controlnet_cond=depths,
                     conditioning_scale = 1.0,
                     return_dict=False,
                     added_cond_kwargs=added_cond_kwargs,
@@ -310,79 +370,13 @@ class ControlnetGuidance(BaseObject):
                 latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
                 
                 #depth_map = self.get_depth_map(images, self.depth_estimator).to(self.device).half()
-                depth_map = depths.permute(0, 3, 1, 2)
-                depth_map = torch.cat([depth_map] * 2, dim=0)
-
-
-                #============================================================================================
-
-                prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
-                    prompt=prompt,
-                    device='cuda:0',
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=True,
-                    negative_prompt=negative_prompt
-                    )
-
-                text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
-
-                original_size = (1024, 1024)
-                target_size = (1024, 1024)
-                (height, width) = (1024, 1024)
-                crops_coords_top_left = (0,0)
-                negative_crops_coords_top_left = (0,0)
-                aesthetic_score = 6
-                negative_aesthetic_score = 2.5
-                
-                if isinstance(depths, list):
-                    original_size = original_size or depths[0].shape[-2:]
-                else:
-                    original_size = original_size or depths.shape[-2:]
-                target_size = target_size or (height, width)
-
-                negative_original_size = original_size
-                negative_target_size = target_size
-                add_text_embeds = pooled_prompt_embeds
-
-                if self.pipe.text_encoder_2 is None:
-                    text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
-                else:
-                    text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
-
-                add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
-                    original_size,
-                    crops_coords_top_left,
-                    target_size,
-                    aesthetic_score,
-                    negative_aesthetic_score,
-                    negative_original_size,
-                    negative_crops_coords_top_left,
-                    negative_target_size,
-                    dtype=text_embeddings.dtype,
-                    text_encoder_projection_dim=text_encoder_projection_dim,
-                )
-
-                add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
-
-                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-                add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-                add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
-                add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
-
-                prompt_embeds = prompt_embeds.to(self.device)
-                add_text_embeds = add_text_embeds.to(self.device)
-                add_time_ids = add_time_ids.to(self.device)
-
-
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-
-                #============================================================================================
+                #depth_map = torch.cat([depths] * 2, dim=0)
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     latent_model_input,
                     torch.cat([t] * 2),
                     encoder_hidden_states=prompt_embeds,
-                    controlnet_cond=depth_map,
+                    controlnet_cond=depths,
                     conditioning_scale = 1.0,
                     return_dict=False,
                     added_cond_kwargs=added_cond_kwargs,
@@ -399,9 +393,7 @@ class ControlnetGuidance(BaseObject):
 
             # perform guidance (high scale from paper!)
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+            noise_pred = noise_pred_text + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         if self.cfg.weighting_strategy == "sds":
             # w(t), sigma_t^2
@@ -416,6 +408,7 @@ class ControlnetGuidance(BaseObject):
             )
 
         grad = w * (noise_pred - noise)
+
 
         guidance_eval_utils = {
             "prompt": prompt,
@@ -447,6 +440,70 @@ class ControlnetGuidance(BaseObject):
     ):
         batch_size = elevation.shape[0]
 
+        #============================================================================================
+
+        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+            prompt=prompt,
+            device='cuda:0',
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompt
+            )
+
+        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+        original_size = (768, 768)
+        target_size = (768, 768)
+        (height, width) = (768, 768)
+        crops_coords_top_left = (0,0)
+        negative_crops_coords_top_left = (0,0)
+        aesthetic_score = 6
+        negative_aesthetic_score = 2.5
+        
+        if isinstance(depths, list):
+            original_size = original_size or depths[0].shape[-2:]
+        else:
+            original_size = original_size or depths.shape[-2:]
+        target_size = target_size or (height, width)
+
+        negative_original_size = original_size
+        negative_target_size = target_size
+        add_text_embeds = pooled_prompt_embeds
+
+        if self.pipe.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+            original_size,
+            crops_coords_top_left,
+            target_size,
+            aesthetic_score,
+            negative_aesthetic_score,
+            negative_original_size,
+            negative_crops_coords_top_left,
+            negative_target_size,
+            dtype=text_embeddings.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+
+        add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
+
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
+        add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds = prompt_embeds.to(self.device)
+        add_text_embeds = add_text_embeds.to(self.device)
+        add_time_ids = add_time_ids.to(self.device)
+
+
+        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+        #============================================================================================
+
         sigma = self.us[t]
         sigma = sigma.view(-1, 1, 1, 1)
 
@@ -465,7 +522,6 @@ class ControlnetGuidance(BaseObject):
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 4, dim=0)
 
-                #depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
                 depth_map = depths
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
@@ -544,9 +600,7 @@ class ControlnetGuidance(BaseObject):
 
                 # perform guidance (high scale from paper!)
                 noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-                noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                    noise_pred_text - noise_pred_uncond
-                )
+                noise_pred = noise_pred_text + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         Ds = zs - sigma * noise_pred
 
@@ -555,14 +609,16 @@ class ControlnetGuidance(BaseObject):
         else:
             grad = -(Ds - zs) / sigma
 
+
         guidance_eval_utils = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "use_perp_neg": prompt_utils.use_perp_neg,
             "neg_guidance_weights": neg_guidance_weights,
             "text_embeddings": text_embeddings,
-            "depth": depths,
             "t_orig": t,
+            "images": images,
+            "depth": depths,
             "latents_noisy": scaled_zs,
             "noise_pred": noise_pred,
         }
@@ -586,21 +642,22 @@ class ControlnetGuidance(BaseObject):
         
 #====================== Prepare the prompt =============================
 
-        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
-        prompt=prompt,
-        device='cuda:0',
-        num_images_per_prompt=1,
-        do_classifier_free_guidance=True,
-        negative_prompt=negative_prompt
-        )
+        #prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+        #prompt=prompt,
+        #device='cuda:0',
+        #num_images_per_prompt=1,
+        #do_classifier_free_guidance=True,
+        #negative_prompt=negative_prompt
+        #)
 
-        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
-
-        self.batch_size = rgb.shape[0]
+        #text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
 
         #depth = depth.to(torch.float16)
 
 #====================== Prepare the Controlnet Image =============================
+        
+        self.batch_size = depth.shape[0]
+        depth = depth.permute(0, 3, 1, 2)
 
         control_image = self.pipe.prepare_control_image(
             image=depth,
@@ -634,7 +691,7 @@ class ControlnetGuidance(BaseObject):
             t,
             self.batch_size,
             1,
-            prompt_embeds.dtype,
+            depth.dtype,
             self.device,
             None,
             True,
@@ -655,14 +712,13 @@ class ControlnetGuidance(BaseObject):
             latents = self.encode_images(rgb_BCHW_512)     
         '''
 
-
         if self.cfg.use_sjc:
             grad, guidance_eval_utils = self.compute_grad_sjc(
-                latents, rgb, depth, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, control_image, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
             )
         else:
             grad, guidance_eval_utils = self.compute_grad_sds(
-                latents, rgb, depth, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, control_image, t, prompt, negative_prompt, prompt_utils, elevation, azimuth, camera_distances
             )
 
         grad = torch.nan_to_num(grad)
@@ -711,72 +767,10 @@ class ControlnetGuidance(BaseObject):
         text_embeddings,
         use_perp_neg=False,
         neg_guidance_weights=None,
+        added_cond_kwargs=None
     ):
-        batch_size = latents_noisy.shape[0]
 
-        #============================================================================================
-
-        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
-            prompt=prompt,
-            device='cuda:0',
-            num_images_per_prompt=1,
-            do_classifier_free_guidance=True,
-            negative_prompt=negative_prompt
-            )
-
-        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
-
-        original_size = (1024, 1024)
-        target_size = (1024, 1024)
-        (height, width) = (1024, 1024)
-        crops_coords_top_left = (0,0)
-        negative_crops_coords_top_left = (0,0)
-        aesthetic_score = 6
-        negative_aesthetic_score = 2.5
-        
-        if isinstance(depth, list):
-            original_size = original_size or depth[0].shape[-2:]
-        else:
-            original_size = original_size or depth.shape[-2:]
-        target_size = target_size or (height, width)
-
-        negative_original_size = original_size
-        negative_target_size = target_size
-        add_text_embeds = pooled_prompt_embeds
-
-        if self.pipe.text_encoder_2 is None:
-            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
-        else:
-            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
-
-        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
-            original_size,
-            crops_coords_top_left,
-            target_size,
-            aesthetic_score,
-            negative_aesthetic_score,
-            negative_original_size,
-            negative_crops_coords_top_left,
-            negative_target_size,
-            dtype=text_embeddings.dtype,
-            text_encoder_projection_dim=text_encoder_projection_dim,
-        )
-
-        add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
-
-        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-        add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
-        add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
-
-        prompt_embeds = prompt_embeds.to(self.device)
-        add_text_embeds = add_text_embeds.to(self.device)
-        add_time_ids = add_time_ids.to(self.device)
-
-
-        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
-
-        #============================================================================================
+        print(f"Use perp neg is : {use_perp_neg}")
 
         if use_perp_neg:
             # pred noise
@@ -829,19 +823,17 @@ class ControlnetGuidance(BaseObject):
             
             latent_model_input  = latent_model_input.to(torch.float16)
             text_embeddings  = text_embeddings.to(torch.float16)
-
-            depth_map = depth_map.permute(2,0,1)
             depth_map = depth_map.to(torch.float16)
 
             down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=text_embeddings,
-                    controlnet_cond=depth_map,
-                    conditioning_scale = 1.0,
-                    return_dict=False,
-                    added_cond_kwargs=added_cond_kwargs,
-                )
+                latent_model_input,
+                t,
+                encoder_hidden_states=text_embeddings,
+                controlnet_cond=depth_map,
+                conditioning_scale = 1.0,
+                return_dict=False,
+                added_cond_kwargs=added_cond_kwargs,
+            )
 
             noise_pred = self.forward_unet(
                 latent_model_input,
@@ -851,11 +843,9 @@ class ControlnetGuidance(BaseObject):
                 mid_block_additional_residual=mid_block_res_sample,
                 added_cond_kwargs=added_cond_kwargs,
             )
-            # perform guidance (high scale from paper!)
+
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
-            noise_pred = noise_pred_text + self.cfg.guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+            noise_pred = noise_pred_text + self.cfg.guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         return noise_pred
 
@@ -893,6 +883,7 @@ class ControlnetGuidance(BaseObject):
         fracs = list((t / self.scheduler.config.num_train_timesteps).cpu().numpy())
         imgs_noisy = self.decode_latents(latents_noisy[:bs]).permute(0, 2, 3, 1)
 
+
         # get prev latent
         latents_1step = []
         pred_1orig = []
@@ -907,27 +898,112 @@ class ControlnetGuidance(BaseObject):
         imgs_1step = self.decode_latents(latents_1step).permute(0, 2, 3, 1)
         imgs_1orig = self.decode_latents(pred_1orig).permute(0, 2, 3, 1)
 
+
+        #====================================Prepare Prompts==============================================
+
+        prompt_embeds,negative_prompt_embeds,pooled_prompt_embeds,negative_pooled_prompt_embeds= self.pipe.encode_prompt(
+            prompt=prompt,
+            device='cuda:0',
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=True,
+            negative_prompt=negative_prompt
+        )
+
+        text_embeddings = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0).to(self.device)
+
+        original_size = (768, 768)
+        target_size = (768, 768)
+        (height, width) = (768, 768)
+        crops_coords_top_left = (0,0)
+        negative_crops_coords_top_left = (0,0)
+        aesthetic_score = 6
+        negative_aesthetic_score = 2.5
+        
+        if isinstance(depth, list):
+            original_size = original_size or depth[0].shape[-2:]
+        else:
+            original_size = original_size or depth.shape[-2:]
+        target_size = target_size or (height, width)
+
+        negative_original_size = original_size
+        negative_target_size = target_size
+        add_text_embeds = pooled_prompt_embeds
+
+        if self.pipe.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+            original_size,
+            crops_coords_top_left,
+            target_size,
+            aesthetic_score,
+            negative_aesthetic_score,
+            negative_original_size,
+            negative_crops_coords_top_left,
+            negative_target_size,
+            dtype=text_embeddings.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+
+        batch_size = latents_noisy.shape[0]
+
+        add_time_ids = add_time_ids.repeat(batch_size * 1, 1)
+
+        prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+        add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+        add_neg_time_ids = add_neg_time_ids.repeat(batch_size * 1, 1)
+        add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+
+        prompt_embeds = prompt_embeds.to(self.device)
+        add_text_embeds = add_text_embeds.to(self.device)
+        add_time_ids = add_time_ids.to(self.device)
+
+        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+        #======================================TRAIN LOOP============================================#
+
         latents_final = []
         for b, i in enumerate(idxs):
-            latents = latents_1step[b : b + 1]
-            text_emb = (
-                text_embeddings[
-                    [b, b + len(idxs), b + 2 * len(idxs), b + 3 * len(idxs)], ...
-                ]
-                if use_perp_neg
-                else text_embeddings[[b, b + len(idxs)], ...]
+            #latents = latents_1step[b : b + 1]
+            #print(f"Text embeddings: {text_embeddings.size()}")
+            #text_emb = (
+            #    text_embeddings[
+            #        [b, b + len(idxs), b + 2 * len(idxs), b + 3 * len(idxs)], ...
+            #    ]
+            #    if use_perp_neg
+            #    else text_embeddings[[b, b + len(idxs)], ...]
+            #)
+            #print(f"text_emb: {text_emb.size()}")
+            #neg_guid = neg_guidance_weights[b : b + 1] if use_perp_neg else None
+            
+            text_emb = text_embeddings
+            neg_guid = None
+
+            rgb_BCHW = images.permute(0, 3, 1, 2).half()
+            latents = self.pipe.prepare_latents(
+                rgb_BCHW,
+                t,
+                self.batch_size,
+                1,
+                rgb_BCHW.dtype,
+                self.device,
+                None,
+                True,
             )
-            neg_guid = neg_guidance_weights[b : b + 1] if use_perp_neg else None
+
             for t in tqdm(self.scheduler.timesteps[i + 1 :], leave=False):
                 # pred noise
                 noise_pred = self.get_noise_pred(
-                    latents, images[b], depth[b], t, prompt, negative_prompt, text_emb, use_perp_neg, neg_guid
+                    latents, images[b], depth[b], t, prompt, negative_prompt, text_emb, use_perp_neg, neg_guid, added_cond_kwargs
                 )
                 # get prev latent
-                latents = self.scheduler.step(noise_pred, t, latents, eta=1)[
-                    "prev_sample"
-                ]
+                latents = self.scheduler.step(noise_pred, t, latents, eta=1).prev_sample
+
             latents_final.append(latents)
+
+#==========================================================TRAIN LOOP==========================================================#
 
         latents_final = torch.cat(latents_final)
         imgs_final = self.decode_latents(latents_final).permute(0, 2, 3, 1)
