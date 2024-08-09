@@ -318,10 +318,10 @@ class BaseLift3DSystem(BaseSystem):
             return x.reshape(-1, *x.shape[2:])
 
         print("Saving images in the train step")
-        print(f"{comp_rgb.size()}")
-        print(f"{guidance_eval_out['depth'].size()}")
         guidance_eval_out['depth'] = guidance_eval_out['depth'].permute(0,2,3,1)
-        print(f"{guidance_eval_out['depth'].size()}")
+
+        print(f"imgs_noisy is of size: {guidance_eval_out['imgs_noisy'].size()}")
+
         self.save_image_grid(
             filename,
             [

@@ -7,8 +7,8 @@ data_type: "random-camera-datamodule"
 data:
   load_type: ${system.load_type}
   batch_size: 1
-  eval_camera_distance: 4.0
-  camera_distance_range: [1.5, 4.0]
+  eval_camera_distance: 5.0
+  camera_distance_range: [3.5, 4.5]
   light_sample_strategy: "dreamfusion3dgs"
   height: 768
   width: 768
@@ -31,7 +31,7 @@ system:
   guidance:
     pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
     #pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
-    guidance_scale: 100.
+    guidance_scale: 5.0
     weighting_strategy: sds
     min_step_percent: 0.02
     max_step_percent: 0.98
