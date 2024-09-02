@@ -177,6 +177,7 @@ pyrightconfig.json
 
 .vscode/
 .threestudio_cache/
+inputs/
 outputs/
 outputs-gradio/
 
