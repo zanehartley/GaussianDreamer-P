@@ -24,13 +24,13 @@ class ControlnetGuidance(BaseObject):
         enable_sequential_cpu_offload: bool = False
         enable_attention_slicing: bool = False
         enable_channels_last_format: bool = False
-        guidance_scale: float = 100.0
+        guidance_scale: float = 7.5
         grad_clip: Optional[
             Any
         ] = None  # field(default_factory=lambda: [0, 2.0, 8.0, 1000])
-        half_precision_weights: bool = True
+        half_precision_weights: bool = False
 
-        min_step_percent: float = 0.02
+        min_step_percent: float = 0.88
         max_step_percent: float = 0.98
         max_step_percent_annealed: float = 0.5
         anneal_start_step: Optional[int] = None
@@ -56,7 +56,8 @@ class ControlnetGuidance(BaseObject):
             torch.float16 if self.cfg.half_precision_weights else torch.float32
         )
 
-        self.controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float16)
+        self.controlnet = ControlNetModel.from_pretrained("lllyasviel/control_v11f1p_sd15_depth", torch_dtype=torch.float32)
+        self.controlnet_conditioning_scale = 0.5
 
         pipe_kwargs = {
             "tokenizer": None,
@@ -144,7 +145,7 @@ class ControlnetGuidance(BaseObject):
         threestudio.info(f"Loaded Stable Diffusion!")
 
     @torch.cuda.amp.autocast(enabled=False)
-    def set_min_max_steps(self, min_step_percent=0.02, max_step_percent=0.98):
+    def set_min_max_steps(self, min_step_percent=0.88, max_step_percent=0.98):
         self.min_step = int(self.num_train_timesteps * min_step_percent)
         self.max_step = int(self.num_train_timesteps * max_step_percent)
 
@@ -154,12 +155,18 @@ class ControlnetGuidance(BaseObject):
         latents: Float[Tensor, "..."],
         t: Float[Tensor, "..."],
         encoder_hidden_states: Float[Tensor, "..."],
+        down_block_additional_residuals: Float[Tensor, "..."], 
+        mid_block_additional_residual: Float[Tensor, "..."],
+        added_cond_kwargs: Dict
     ) -> Float[Tensor, "..."]:
         input_dtype = latents.dtype
         return self.unet(
             latents.to(self.weights_dtype),
             t.to(self.weights_dtype),
             encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+            down_block_additional_residuals=down_block_additional_residuals, 
+            mid_block_additional_residual=mid_block_additional_residual,
+            added_cond_kwargs=added_cond_kwargs,
         ).sample.to(input_dtype)
 
     @torch.cuda.amp.autocast(enabled=False)
@@ -187,26 +194,22 @@ class ControlnetGuidance(BaseObject):
         image = self.vae.decode(latents.to(self.weights_dtype)).sample
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
-    
-    def get_depth_map(image, depth_estimator):
-        image = depth_estimator(image)["depth"]
-        image = np.array(image)
-        image = image[:, :, None]
-        image = np.concatenate([image, image, image], axis=2)
-        detected_map = torch.from_numpy(image).float() / 255.0
-        depth_map = detected_map.permute(2, 0, 1)
-        return depth_map
 
     def compute_grad_sds(
         self,
         latents: Float[Tensor, "B 4 64 64"],
         images: Float[Tensor, "B H W C"],
+        depths: Float[Tensor, "B H W C"],
         t: Int[Tensor, "B"],
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
         azimuth: Float[Tensor, "B"],
         camera_distances: Float[Tensor, "B"],
     ):
+                
+        #depth_map = depths.permute(0, 3, 1, 2)
+        depths = torch.cat([depths] * 3, dim=1)
+
         batch_size = elevation.shape[0]
 
         if prompt_utils.use_perp_neg:
@@ -221,14 +224,16 @@ class ControlnetGuidance(BaseObject):
                 latents_noisy = self.scheduler.add_noise(latents, noise, t)
                 latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
 
-                depth_map = self.get_depth_map(images, self.depth_estimator).unsqueeze(0).to(self.device).half()
+                #depth_map = depths
 
                 down_block_res_samples, mid_block_res_sample = self.controlnet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=text_embeddings,
                     controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
                     return_dict=False,
+                    added_cond_kwargs=None,
                 )
 
                 noise_pred = self.forward_unet(
@@ -267,10 +272,26 @@ class ControlnetGuidance(BaseObject):
                 latents_noisy = self.scheduler.add_noise(latents, noise, t)
                 # pred noise
                 latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+                
+                depth_map = torch.cat([depths] * 2, dim=0)
+                
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    torch.cat([t] * 2),
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
+                    return_dict=False,
+                    added_cond_kwargs=None,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 2),
                     encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=None,
                 )
 
             # perform guidance (high scale from paper!)
@@ -300,6 +321,7 @@ class ControlnetGuidance(BaseObject):
             "t_orig": t,
             "latents_noisy": latents_noisy,
             "noise_pred": noise_pred,
+            "depths": depths,
         }
 
         return grad, guidance_eval_utils
@@ -307,6 +329,7 @@ class ControlnetGuidance(BaseObject):
     def compute_grad_sjc(
         self,
         latents: Float[Tensor, "B 4 64 64"],
+        depths: Float[Tensor, "B H W C"],
         t: Int[Tensor, "B"],
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
@@ -332,10 +355,26 @@ class ControlnetGuidance(BaseObject):
                 scaled_zs = zs / torch.sqrt(1 + sigma**2)
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 4, dim=0)
+                
+                depth_map = depths
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
+                    return_dict=False,
+                    added_cond_kwargs=None,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
                     torch.cat([t] * 4),
                     encoder_hidden_states=text_embeddings,
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=None,
                 )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -370,11 +409,27 @@ class ControlnetGuidance(BaseObject):
 
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 2, dim=0)
+
+                depth_map = depths
+
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
+                    return_dict=False,
+                    added_cond_kwargs=None,
+                )
+
                 noise_pred = self.forward_unet(
                     latent_model_input,
-                    torch.cat([t] * 2),
+                    torch.cat([t] * 4),
                     encoder_hidden_states=text_embeddings,
-                )
+                    down_block_additional_residuals=down_block_res_samples, 
+                    mid_block_additional_residual=mid_block_res_sample,
+                    added_cond_kwargs=None,
+                )  # (4B, 3, 64, 64)
 
                 # perform guidance (high scale from paper!)
                 noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
@@ -396,6 +451,7 @@ class ControlnetGuidance(BaseObject):
             "t_orig": t,
             "latents_noisy": scaled_zs,
             "noise_pred": noise_pred,
+            "depths": depths,
         }
 
         return grad, guidance_eval_utils
@@ -403,6 +459,7 @@ class ControlnetGuidance(BaseObject):
     def __call__(
         self,
         rgb: Float[Tensor, "B H W C"],
+        depths: Float[Tensor, "B H W C"],
         prompt_utils: PromptProcessorOutput,
         elevation: Float[Tensor, "B"],
         azimuth: Float[Tensor, "B"],
@@ -412,6 +469,20 @@ class ControlnetGuidance(BaseObject):
         **kwargs,
     ):
         batch_size = rgb.shape[0]
+
+        depths = depths.permute(0, 3, 1, 2)
+
+        depths = self.pipe.prepare_control_image(
+            image=depths,
+            width = 512,
+            height= 512,
+            batch_size=batch_size,
+            num_images_per_prompt= 1,
+            device=self.device,
+            dtype=rgb.dtype,
+            do_classifier_free_guidance=False,
+            guess_mode=False,
+        )
 
         rgb_BCHW = rgb.permute(0, 3, 1, 2)
         latents: Float[Tensor, "B 4 64 64"]
@@ -439,11 +510,11 @@ class ControlnetGuidance(BaseObject):
 
         if self.cfg.use_sjc:
             grad, guidance_eval_utils = self.compute_grad_sjc(
-                latents, t, prompt_utils, elevation, azimuth, camera_distances
+                latents, depths, t, prompt_utils, elevation, azimuth, camera_distances
             )
         else:
             grad, guidance_eval_utils = self.compute_grad_sds(
-                latents, rgb, t, prompt_utils, elevation, azimuth, camera_distances
+                latents, rgb, depths, t, prompt_utils, elevation, azimuth, camera_distances
             )
 
         grad = torch.nan_to_num(grad)
@@ -474,6 +545,7 @@ class ControlnetGuidance(BaseObject):
                     f"n{n:.02f}\ne{e.item():.01f}\na{a.item():.01f}\nc{c.item():.02f}"
                 )
             guidance_eval_out.update({"texts": texts})
+            guidance_eval_out.update({"depth": depths.permute(0, 2, 3, 1)})
             guidance_out.update({"eval": guidance_eval_out})
 
         return guidance_out
@@ -483,6 +555,7 @@ class ControlnetGuidance(BaseObject):
     def get_noise_pred(
         self,
         latents_noisy,
+        depths,
         t,
         text_embeddings,
         use_perp_neg=False,
@@ -490,14 +563,29 @@ class ControlnetGuidance(BaseObject):
     ):
         batch_size = latents_noisy.shape[0]
         
-
         if use_perp_neg:
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
+           
+            depth_map = depths
+            
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
+                    return_dict=False,
+                    added_cond_kwargs=None,
+                )
+
             noise_pred = self.forward_unet(
                 latent_model_input,
                 torch.cat([t.reshape(1)] * 4).to(self.device),
                 encoder_hidden_states=text_embeddings,
+                down_block_additional_residuals=down_block_res_samples, 
+                mid_block_additional_residual=mid_block_res_sample,
+                added_cond_kwargs=None,
             )  # (4B, 3, 64, 64)
 
             noise_pred_text = noise_pred[:batch_size]
@@ -519,11 +607,28 @@ class ControlnetGuidance(BaseObject):
         else:
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
+            
+            depth_map = depths
+
+            down_block_res_samples, mid_block_res_sample = self.controlnet(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=text_embeddings,
+                    controlnet_cond=depth_map,
+                    conditioning_scale = self.controlnet_conditioning_scale,
+                    return_dict=False,
+                    added_cond_kwargs=None,
+                )
+
             noise_pred = self.forward_unet(
                 latent_model_input,
                 torch.cat([t.reshape(1)] * 2).to(self.device),
                 encoder_hidden_states=text_embeddings,
-            )
+                down_block_additional_residuals=down_block_res_samples, 
+                mid_block_additional_residual=mid_block_res_sample,
+                added_cond_kwargs=None,
+            )  # (4B, 3, 64, 64)
+
             # perform guidance (high scale from paper!)
             noise_pred_text, noise_pred_uncond = noise_pred.chunk(2)
             noise_pred = noise_pred_text + self.cfg.guidance_scale * (
@@ -536,6 +641,7 @@ class ControlnetGuidance(BaseObject):
     @torch.no_grad()
     def guidance_eval(
         self,
+        depths,
         t_orig,
         text_embeddings,
         latents_noisy,
@@ -579,6 +685,7 @@ class ControlnetGuidance(BaseObject):
         latents_final = []
         for b, i in enumerate(idxs):
             latents = latents_1step[b : b + 1]
+            this_depth = depths[b : b + 1]
             text_emb = (
                 text_embeddings[
                     [b, b + len(idxs), b + 2 * len(idxs), b + 3 * len(idxs)], ...
@@ -590,7 +697,7 @@ class ControlnetGuidance(BaseObject):
             for t in tqdm(self.scheduler.timesteps[i + 1 :], leave=False):
                 # pred noise
                 noise_pred = self.get_noise_pred(
-                    latents, t, text_emb, use_perp_neg, neg_guid
+                    latents, this_depth, t, text_emb, use_perp_neg, neg_guid
                 )
                 # get prev latent
                 latents = self.scheduler.step(noise_pred, t, latents, eta=1)[

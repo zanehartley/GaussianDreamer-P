@@ -408,6 +408,7 @@ class SaverMixin:
         save_path = self.get_save_path(filename)
         matcher = re.compile(matcher)
         img_dir = os.path.join(self.get_save_dir(), img_dir)
+        os.makedirs(img_dir, exist_ok=True)
         imgs = []
         for f in os.listdir(img_dir):
             if matcher.search(f):

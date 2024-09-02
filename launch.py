@@ -5,6 +5,7 @@ import os
 import sys
 import shutil
 
+sys.settrace
 
 class ColoredFilter(logging.Filter):
     """
@@ -98,6 +99,11 @@ def main(args, extras) -> None:
     # parse YAML config to OmegaConf
     cfg: ExperimentConfig
     cfg = load_config(args.config, cli_args=extras, n_gpus=n_gpus)
+
+    cfg.system.prompt_processor.prompt_front= f"{cfg.system.prompt_processor.prompt}, forward view"
+    cfg.system.prompt_processor.prompt_side= f"{cfg.system.prompt_processor.prompt}, forward view"
+    cfg.system.prompt_processor.prompt_back=  f"{cfg.system.prompt_processor.prompt}, forward view"
+    cfg.system.prompt_processor.prompt_overhead = f"{cfg.system.prompt_processor.prompt}, birds-eye view, top-down view"
 
     # set a different seed for each device
     pl.seed_everything(cfg.seed + get_rank(), workers=True)

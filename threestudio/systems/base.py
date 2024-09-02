@@ -316,7 +316,7 @@ class BaseLift3DSystem(BaseSystem):
 
         def merge12(x):
             return x.reshape(-1, *x.shape[2:])
-
+        
         self.save_image_grid(
             filename,
             [
@@ -358,6 +358,15 @@ class BaseLift3DSystem(BaseSystem):
                     {
                         "type": "rgb",
                         "img": merge12(resize(guidance_eval_out["imgs_final"])),
+                        "kwargs": {"data_format": "HWC"},
+                    }
+                ]
+            )
+            + (
+                [
+                    {
+                        "type": "rgb",
+                        "img": merge12(resize(guidance_eval_out["depth"])),
                         "kwargs": {"data_format": "HWC"},
                     }
                 ]

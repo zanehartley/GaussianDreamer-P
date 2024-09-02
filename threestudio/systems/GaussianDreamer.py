@@ -10,6 +10,7 @@ from gaussiansplatting.arguments import ModelParams, PipelineParams, get_combine
 from gaussiansplatting.scene.cameras import Camera
 from argparse import ArgumentParser, Namespace
 import os
+import copy
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from gaussiansplatting.utils.sh_utils import SH2RGB
@@ -94,7 +95,7 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.gaussian = GaussianModel(sh_degree = self.sh_degree)
         bg_color = [1, 1, 1] if False else [0, 0, 0]
-        self.background_tensor = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        self.background_tensor = torch.tensor(bg_color, dtype=torch.float16, device="cuda")
 
     
     def save_gif_to_file(self,images, output_file):  
@@ -110,6 +111,9 @@ class GaussianDreamer(BaseLift3DSystem):
         # Load the PLY file using Open3D
         point_cloud = o3d.io.read_point_cloud(filename)
         
+        voxel_size = 0.0025  # Adjust voxel size as needed
+        point_cloud = point_cloud.voxel_down_sample(voxel_size)
+
         # Get coordinates from the point cloud
         coords = np.asarray(point_cloud.points)
         scaler = MinMaxScaler(feature_range=(-0.9, 0.9))  # Set the scaling range
@@ -122,14 +126,14 @@ class GaussianDreamer(BaseLift3DSystem):
             # Handle the case where no colors are present (return dummy values or None)
             #rgb = np.zeros((coords.shape[0], 3))  # Example: fill with black (0, 0, 0)
             green_values = np.random.rand(coords.shape[0]) * 0.5 + 0.25  # Random between 0.25 and 0.75
-            rgb = np.stack((0, green_values, 0), axis=-1)
+            zeros = np.zeros(coords.shape[0])
+            rgb = np.stack((zeros, green_values, zeros), axis=-1)
         # You can add additional logic here to handle other data in the PLY file (optional)
 
         return coords, rgb, 0.4  # You can return additional data in the third slot
 
 
     def shape(self):
-
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         xm = load_model('transmitter', device=device)
         model = load_model('text300M', device=device)
@@ -238,7 +242,7 @@ class GaussianDreamer(BaseLift3DSystem):
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
         elif self.load_type==2:
-            filename = "./inputs/lewis.ply"
+            filename = "./inputs/fake_complex_plant_nerf_denoised_new.ply"
             coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
@@ -262,19 +266,18 @@ class GaussianDreamer(BaseLift3DSystem):
         for id in range(batch['c2w_3dgs'].shape[0]):
        
             viewpoint_cam  = Camera(c2w = batch['c2w_3dgs'][id],FoVy = batch['fovy'][id],height = batch['height'],width = batch['width'])
-
-
-            render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground)
+            render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground.to(torch.float32))
+            render_pkg_for_depth = render(viewpoint_cam, self.gaussian_copy, self.pipe, renderbackground.to(torch.float32))
             image, viewspace_point_tensor, _, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             self.viewspace_point_list.append(viewspace_point_tensor)
 
-            
             if id == 0:
                 self.radii = radii
             else:
                 self.radii = torch.max(radii,self.radii)
                 
             depth = render_pkg["depth_3dgs"]
+            #depth = render_pkg_for_depth["depth_3dgs"]
             depth =  depth.permute(1, 2, 0)
             
             image =  image.permute(1, 2, 0)
@@ -283,6 +286,7 @@ class GaussianDreamer(BaseLift3DSystem):
 
         images = torch.stack(images, 0)
         depths = torch.stack(depths, 0)
+        
         self.visibility_filter = self.radii>0.0
         render_pkg["comp_rgb"] = images
         render_pkg["depth"] = depths
@@ -303,7 +307,7 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.gaussian.update_learning_rate(self.true_global_step)
         
-        if self.true_global_step > 500:
+        if self.true_global_step > 2200:
             self.guidance.set_min_max_steps(min_step_percent=0.02, max_step_percent=0.55)
 
         self.gaussian.update_learning_rate(self.true_global_step)
@@ -314,6 +318,7 @@ class GaussianDreamer(BaseLift3DSystem):
         prompt_utils = self.prompt_processor()
         #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
+        depths = out["depth"].detach()
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
@@ -321,13 +326,8 @@ class GaussianDreamer(BaseLift3DSystem):
         ########################## 2D Diffusion Step #############################
         #This step seems to actually do the 2D diffusion and perhaps also the comparison to the real image.
         guidance_out = self.guidance(
-            images, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
+            images, depths, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
-
-        #print("====================2D-DIFFUSION=======================")
-        #print(f"images: {type(images)}")
-        #print(f"guidance_out: {type(guidance_out)}")
-        #print("=======================================================")
 
         loss = 0.0
 
@@ -415,7 +415,7 @@ class GaussianDreamer(BaseLift3DSystem):
         only_rgb = True
         bg_color = [1, 1, 1] if False else [0, 0, 0]
 
-        testbackground_tensor = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        testbackground_tensor = torch.tensor(bg_color, dtype=torch.float16, device="cuda")
 
         out = self(batch,testbackground_tensor)
         if only_rgb:
@@ -535,6 +535,8 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.pipe = PipelineParams(self.parser)
         self.gaussian.training_setup(opt)
+
+        self.gaussian_copy = copy.deepcopy(self.gaussian)
         
         ret = {
             "optimizer": self.gaussian.optimizer,
