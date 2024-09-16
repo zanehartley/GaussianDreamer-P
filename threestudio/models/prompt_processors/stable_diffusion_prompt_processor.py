@@ -75,6 +75,7 @@ class StableDiffusionPromptProcessor(PromptProcessor):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, subfolder="tokenizer"
         )
+        print(pretrained_model_name_or_path)
         text_encoder = CLIPTextModel.from_pretrained(
             pretrained_model_name_or_path,
             subfolder="text_encoder",

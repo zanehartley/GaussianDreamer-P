@@ -13,6 +13,8 @@ from threestudio.utils.misc import C, cleanup, get_device, load_module_weights
 from threestudio.utils.saving import SaverMixin
 from threestudio.utils.typing import *
 
+import torch
+
 
 class BaseSystem(pl.LightningModule, Updateable, SaverMixin):
     @dataclass
@@ -317,6 +319,11 @@ class BaseLift3DSystem(BaseSystem):
         def merge12(x):
             return x.reshape(-1, *x.shape[2:])
         
+        min_value = torch.min(guidance_eval_out["depth"])
+        max_value = torch.max(guidance_eval_out["depth"])
+        print("Minimum value:", min_value)
+        print("Maximum value:", max_value)
+
         self.save_image_grid(
             filename,
             [

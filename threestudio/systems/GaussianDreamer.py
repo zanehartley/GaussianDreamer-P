@@ -25,8 +25,21 @@ import io
 from PIL import Image  
 import open3d as o3d
 
-from sklearn.preprocessing import MinMaxScaler
+from torchvision.transforms.functional import equalize
 
+from sklearn.preprocessing import MinMaxScaler
+import cv2
+
+def histogram_equalization_pytorch(depth_map):
+    # Normalize the depth map to the range [0, 1]
+    normalized_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
+    # Calculate the cumulative distribution function (CDF)
+    cdf = torch.cumsum(normalized_depth.histc(), dim=0)
+    # Normalize the CDF to the range [0, 1]
+    normalized_cdf = cdf / cdf[-1]
+    # Map the normalized depth values to the normalized CDF
+    equalized_depth = normalized_cdf[normalized_depth.long()]
+    return equalized_depth
 
 def load_ply(path,save_path):
     C0 = 0.28209479177387814
@@ -107,17 +120,58 @@ class GaussianDreamer(BaseLift3DSystem):
             with open(output_file, 'wb') as file:  
                 file.write(writer.read())
     
+    def scale_to_longest_dimension(self, coords, target_range=(-0.9, 0.9)):
+        """
+        Scales the coordinates to the longest dimension while maintaining proportions.
+
+        Args:
+            coords: A NumPy array of shape (n, 3) representing the coordinates.
+            target_range: The desired range for the longest dimension.
+
+        Returns:
+            A NumPy array of the scaled coordinates.
+        """
+
+        # Calculate the range of each dimension
+        ranges = np.max(coords, axis=0) - np.min(coords, axis=0)
+
+        # Find the index of the longest dimension
+        longest_dim_idx = np.argmax(ranges)
+
+        # Calculate the scaling factor for the longest dimension
+        scaling_factor = (target_range[1] - target_range[0]) / ranges[longest_dim_idx]
+
+        # Scale all dimensions proportionally
+        scaled_coords = coords * scaling_factor
+
+        return scaled_coords
+
     def load_ply_and_get_data(self, filename):
         # Load the PLY file using Open3D
         point_cloud = o3d.io.read_point_cloud(filename)
         
-        voxel_size = 0.0025  # Adjust voxel size as needed
+        voxel_size = 0.001  # Adjust voxel size as needed
         point_cloud = point_cloud.voxel_down_sample(voxel_size)
 
         # Get coordinates from the point cloud
         coords = np.asarray(point_cloud.points)
-        scaler = MinMaxScaler(feature_range=(-0.9, 0.9))  # Set the scaling range
-        coords = scaler.fit_transform(coords)
+
+        # Print max and min values before scaling
+        print("Before scaling:")
+        print("X-axis: min =", coords[:, 0].min(), ", max =", coords[:, 0].max())
+        print("Y-axis: min =", coords[:, 1].min(), ", max =", coords[:, 1].max())
+        print("Z-axis: min =", coords[:, 2].min(), ", max =", coords[:, 2].max())
+
+        # Scale coordinates
+        #scaler = MinMaxScaler(feature_range=(-0.9, 0.9))  # Set the scaling range
+        #coords = scaler.fit_transform(coords)
+        coords = self.scale_to_longest_dimension(coords)
+
+        # Print max and min values after scaling
+        print("After scaling:")
+        print("X-axis: min =", coords[:, 0].min(), ", max =", coords[:, 0].max())
+        print("Y-axis: min =", coords[:, 1].min(), ", max =", coords[:, 1].max())
+        print("Z-axis: min =", coords[:, 2].min(), ", max =", coords[:, 2].max())
 
         # Check if RGB color information exists
         if point_cloud.has_colors():
@@ -242,7 +296,7 @@ class GaussianDreamer(BaseLift3DSystem):
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
         elif self.load_type==2:
-            filename = "./inputs/fake_complex_plant_nerf_denoised_new.ply"
+            filename = "./inputs/lewis.ply"
             coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
@@ -276,8 +330,9 @@ class GaussianDreamer(BaseLift3DSystem):
             else:
                 self.radii = torch.max(radii,self.radii)
                 
-            depth = render_pkg["depth_3dgs"]
-            #depth = render_pkg_for_depth["depth_3dgs"]
+            #depth = render_pkg["depth_3dgs"]
+            depth = render_pkg_for_depth["depth_3dgs"]
+            depth = equalize(depth.to(torch.uint8))
             depth =  depth.permute(1, 2, 0)
             
             image =  image.permute(1, 2, 0)
@@ -307,8 +362,8 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.gaussian.update_learning_rate(self.true_global_step)
         
-        if self.true_global_step > 2200:
-            self.guidance.set_min_max_steps(min_step_percent=0.02, max_step_percent=0.55)
+        if self.true_global_step > 1100:
+            self.guidance.set_min_max_steps(min_step_percent=0.02, max_step_percent=0.35)
 
         self.gaussian.update_learning_rate(self.true_global_step)
 
@@ -319,6 +374,9 @@ class GaussianDreamer(BaseLift3DSystem):
         #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
         depths = out["depth"].detach()
+
+        depth_np = depths[0].detach().cpu().numpy()
+        cv2.imwrite("./test_depth.png", depth_np * 255/np.max(depth_np))
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False

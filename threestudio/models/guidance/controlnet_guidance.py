@@ -546,6 +546,7 @@ class ControlnetGuidance(BaseObject):
                 )
             guidance_eval_out.update({"texts": texts})
             guidance_eval_out.update({"depth": depths.permute(0, 2, 3, 1)})
+            guidance_eval_out.update({"depth": depths.permute(0, 2, 3, 1)})
             guidance_out.update({"eval": guidance_eval_out})
 
         return guidance_out
