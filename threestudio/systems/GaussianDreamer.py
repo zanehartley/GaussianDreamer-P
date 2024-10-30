@@ -29,7 +29,7 @@ from torchvision.transforms.functional import equalize
 
 from sklearn.preprocessing import MinMaxScaler
 import cv2
-
+   
 def histogram_equalization_pytorch(depth_map):
     # Normalize the depth map to the range [0, 1]
     normalized_depth = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min())
@@ -109,6 +109,16 @@ class GaussianDreamer(BaseLift3DSystem):
         self.gaussian = GaussianModel(sh_degree = self.sh_degree)
         bg_color = [1, 1, 1] if False else [0, 0, 0]
         self.background_tensor = torch.tensor(bg_color, dtype=torch.float16, device="cuda")
+        
+        # The minimum depth intensity for pixels that are part of the object
+        #(ensures that parts of the object do not blend into the background)
+        self.min_depth_intensity = 0.1
+ 
+        # Scale the object depth for better appearance and distinction from the background
+        self.depth_intensity_scale = 1.75
+ 
+        # The value that determines if the depth is part of the background
+        self.depth_background_cutoff = 0.97
 
     
     def save_gif_to_file(self,images, output_file):  
@@ -121,16 +131,12 @@ class GaussianDreamer(BaseLift3DSystem):
                 file.write(writer.read())
     
     def scale_to_longest_dimension(self, coords, target_range=(-0.9, 0.9)):
-        """
-        Scales the coordinates to the longest dimension while maintaining proportions.
 
-        Args:
-            coords: A NumPy array of shape (n, 3) representing the coordinates.
-            target_range: The desired range for the longest dimension.
 
-        Returns:
-            A NumPy array of the scaled coordinates.
-        """
+        mean_coords = np.mean(coords, axis=0)
+        print(f"Center is: {mean_coords}")
+        coords -= mean_coords
+        print(f"Center is: {mean_coords}")
 
         # Calculate the range of each dimension
         ranges = np.max(coords, axis=0) - np.min(coords, axis=0)
@@ -145,6 +151,136 @@ class GaussianDreamer(BaseLift3DSystem):
         scaled_coords = coords * scaling_factor
 
         return scaled_coords
+            
+    def calculate_erosion_kernal(self):
+            """
+            Calculate the size of the erosion kernel based on the camera's distance from the object.
+    
+            The erosion kernel determines the 'harshness' of the edge removal during depth map processing.
+            Closer camera is to the object, the 'harsher' the kernel needs to be
+    
+            Returns:
+                int: The size of the erosion kernel. Possible values are 3, 5, or 7 depending on the camera's radius.
+            """
+            # Calculate erosion kernal (this determines the 'harshness' of the edge removal)
+            # Closer camera is to the object, the 'harsher' the kernel needs to be
+            erode_kernal_size = 7
+            if self.cfg.radius < 2.0:
+                erode_kernal_size = 3
+            elif self.cfg.radius < 4.0:
+                erode_kernal_size = 5
+    
+            return erode_kernal_size
+   
+    def normalise_depth_maps(self, depth_maps):
+        """
+        This function normalizes depth maps by identifying and separating the background from the foreground,
+        rescaling the depth intensities, and applying dilation and erosion to reduce noise and remove erroneous edges.
+
+        Args:
+            depth_maps (torch.Tensor): The input depth maps to be normalized and processed.
+
+        Returns:
+            torch.Tensor: The processed and normalized depth maps with refined depth information.
+        """
+
+        depths_np = depth_maps.detach().cpu().numpy()
+
+        # Determine background from foreground
+        depths_np = np.round(depths_np, 2)
+        unique, counts = np.unique(depths_np, return_counts=True)
+        start_bin = unique[1]
+        end_bin = unique[-1]
+
+        # Invert image and ensure that background is still set to 0
+        normalised_depths =  1.0 - ((np.maximum((depths_np-start_bin), np.full(depths_np.shape, 0)))/(end_bin-start_bin))
+        normalised_depths = np.where((normalised_depths < self.depth_background_cutoff), normalised_depths, 0)
+
+        # Rescale the image to ensure that depth of object has a minumum intensity
+        normalised_depths = np.minimum(((normalised_depths + self.min_depth_intensity) * self.depth_intensity_scale), np.full(depths_np.shape, 1))
+        normalised_depths = np.where((normalised_depths > (self.min_depth_intensity * self.depth_intensity_scale)), normalised_depths, 0)
+
+        eroded_depths = np.array([])
+        for normalised_depth in normalised_depths:
+
+            # Dilate depth to ensure that object depth is uniform (removes noise)
+            #kernel = np.ones((3,3), np.uint8)
+            #normalised_depth = cv2.dilate(normalised_depth, kernel, iterations=1)
+
+            # Remove erroneous edges from depth of object
+            erode_kernal_size = self.calculate_erosion_kernal()
+
+            kernel = np.ones((erode_kernal_size, erode_kernal_size), np.uint8)
+            normalised_depth = cv2.erode(normalised_depth, kernel, iterations=1)
+
+            """kernel = np.ones((erode_kernal_size-2, erode_kernal_size-2), np.uint8)
+            normalised_depth = cv2.erode(normalised_depth, kernel, iterations=1)"""
+
+            normalised_depth = np.expand_dims(normalised_depth, axis=0)
+
+            if len(eroded_depths) == 0:
+                eroded_depths = normalised_depth
+            else:
+                eroded_depths = np.concatenate((eroded_depths, normalised_depth))
+
+        eroded_depths = np.expand_dims(eroded_depths, axis=3)
+
+        return torch.from_numpy(eroded_depths)
+   
+    def normalise_depth_maps(self, depth_maps):
+        """
+        This function normalizes depth maps by identifying and separating the background from the foreground,
+        rescaling the depth intensities, and applying dilation and erosion to reduce noise and remove erroneous edges.
+ 
+        Args:
+            depth_maps (torch.Tensor): The input depth maps to be normalized and processed.
+ 
+        Returns:
+            torch.Tensor: The processed and normalized depth maps with refined depth information.
+        """
+ 
+        depths_np = depth_maps.detach().cpu().numpy()
+ 
+        # Determine background from foreground
+        depths_np = np.round(depths_np, 2)
+        unique, counts = np.unique(depths_np, return_counts=True)
+        start_bin = unique[1]
+        end_bin = unique[-1]
+ 
+        # Invert image and ensure that background is still set to 0
+        normalised_depths =  1.0 - ((np.maximum((depths_np-start_bin), np.full(depths_np.shape, 0)))/(end_bin-start_bin))
+        normalised_depths = np.where((normalised_depths < self.depth_background_cutoff), normalised_depths, 0)
+ 
+        # Rescale the image to ensure that depth of object has a minumum intensity
+        normalised_depths = np.minimum(((normalised_depths + self.min_depth_intensity) * self.depth_intensity_scale), np.full(depths_np.shape, 1))
+        normalised_depths = np.where((normalised_depths > (self.min_depth_intensity * self.depth_intensity_scale)), normalised_depths, 0)
+ 
+        eroded_depths = np.array([])
+        for normalised_depth in normalised_depths:
+ 
+            # Dilate depth to ensure that object depth is uniform (removes noise)
+            #kernel = np.ones((3,3), np.uint8)
+            #normalised_depth = cv2.dilate(normalised_depth, kernel, iterations=1)
+ 
+            # Remove erroneous edges from depth of object
+            erode_kernal_size = self.calculate_erosion_kernal()
+ 
+            kernel = np.ones((erode_kernal_size, erode_kernal_size), np.uint8)
+            normalised_depth = cv2.erode(normalised_depth, kernel, iterations=1)
+ 
+            kernel = np.ones((erode_kernal_size-2, erode_kernal_size-2), np.uint8)
+            normalised_depth = cv2.erode(normalised_depth, kernel, iterations=1)
+ 
+            normalised_depth = np.expand_dims(normalised_depth, axis=0)
+ 
+            if len(eroded_depths) == 0:
+                eroded_depths = normalised_depth
+            else:
+                eroded_depths = np.concatenate((eroded_depths, normalised_depth))
+ 
+        eroded_depths = np.expand_dims(eroded_depths, axis=3)
+ 
+        return torch.from_numpy(eroded_depths)
 
     def load_ply_and_get_data(self, filename):
         # Load the PLY file using Open3D
@@ -174,6 +310,7 @@ class GaussianDreamer(BaseLift3DSystem):
         print("Z-axis: min =", coords[:, 2].min(), ", max =", coords[:, 2].max())
 
         # Check if RGB color information exists
+        '''
         if point_cloud.has_colors():
             rgb = np.asarray(point_cloud.colors)
         else:
@@ -182,8 +319,8 @@ class GaussianDreamer(BaseLift3DSystem):
             green_values = np.random.rand(coords.shape[0]) * 0.5 + 0.25  # Random between 0.25 and 0.75
             zeros = np.zeros(coords.shape[0])
             rgb = np.stack((zeros, green_values, zeros), axis=-1)
-        # You can add additional logic here to handle other data in the PLY file (optional)
-
+        '''
+        rgb = np.full(coords.shape, 0.5)
         return coords, rgb, 0.4  # You can return additional data in the third slot
 
 
@@ -296,7 +433,7 @@ class GaussianDreamer(BaseLift3DSystem):
         elif self.load_type==1:
             coords,rgb,scale = self.smpl()
         elif self.load_type==2:
-            filename = "./inputs/lewis.ply"
+            filename = "./inputs/duel_bean_1.ply"
             coords, rgb, scale = self.load_ply_and_get_data(filename)
         else:
             raise NotImplementedError
@@ -332,7 +469,6 @@ class GaussianDreamer(BaseLift3DSystem):
                 
             #depth = render_pkg["depth_3dgs"]
             depth = render_pkg_for_depth["depth_3dgs"]
-            depth = equalize(depth.to(torch.uint8))
             depth =  depth.permute(1, 2, 0)
             
             image =  image.permute(1, 2, 0)
@@ -362,21 +498,31 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.gaussian.update_learning_rate(self.true_global_step)
         
-        if self.true_global_step > 1100:
-            self.guidance.set_min_max_steps(min_step_percent=0.02, max_step_percent=0.35)
+        if self.true_global_step > 600:
+            self.guidance.set_min_max_steps(min_step_percent=0.12, max_step_percent=0.35)
+            #self.gaussian._xyz.requres_grad = False
+        if self.true_global_step > 1000:
+            self.guidance.set_min_max_steps(min_step_percent=0.12, max_step_percent=0.25)
+        if self.true_global_step > 2000:
+            self.guidance.set_min_max_steps(min_step_percent=0.075, max_step_percent=0.15)
 
         self.gaussian.update_learning_rate(self.true_global_step)
 
         #This step seems to render the image from the gaussian splat
-        out = self(batch) 
+        out = self(batch)
 
         prompt_utils = self.prompt_processor()
         #This step then gets the image from the gaussian splat render
         images = out["comp_rgb"]
         depths = out["depth"].detach()
+        normalised_depths = self.normalise_depth_maps(depths)
 
-        depth_np = depths[0].detach().cpu().numpy()
+        depth_np = normalised_depths[0].detach().cpu().numpy()
         cv2.imwrite("./test_depth.png", depth_np * 255/np.max(depth_np))
+
+        for i in range(images.shape[0]):
+            cv2.imwrite(f"./outputs/test_depth{i}_{self.true_global_step}.png", normalised_depths[i].numpy()*255)
+            cv2.imwrite(f"./outputs/test_rgb{i}_{self.true_global_step}.png", images[i].detach().cpu().numpy()*255)
 
         guidance_eval = (self.true_global_step % 200 == 0)
         # guidance_eval = False
@@ -384,7 +530,7 @@ class GaussianDreamer(BaseLift3DSystem):
         ########################## 2D Diffusion Step #############################
         #This step seems to actually do the 2D diffusion and perhaps also the comparison to the real image.
         guidance_out = self.guidance(
-            images, depths, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
+            images, normalised_depths, prompt_utils, **batch, rgb_as_latents=False,guidance_eval=guidance_eval
         )
 
         loss = 0.0
@@ -451,7 +597,7 @@ class GaussianDreamer(BaseLift3DSystem):
             + (
                 [
                     {
-                        "type": "rgb",
+                        "type": "grayscale",
                         "img": out["comp_normal"][0],
                         "kwargs": {"data_format": "HWC", "data_range": (0, 1)},
                     }
@@ -583,21 +729,93 @@ class GaussianDreamer(BaseLift3DSystem):
             self.save_gif_to_file(self.shapeimages, self.get_save_path("shape.gif"))
         load_ply(save_path,self.get_save_path(f"it{self.true_global_step}-test-color.ply"))
         
+    def cull_large_gaussians(self, cull_std_factor=0):
+ 
+        # Calculate Gaussian Volumes
+        gaussian_sizes = torch.sum(self.gaussian.get_scaling, axis=1)
+ 
+        # Reoder Gaussians based on volume
+        sorted_sizes, sorted_indices = torch.sort(gaussian_sizes)
+
+        #print(self.gaussian.get_scaling.shape)
+ 
+        # Get the mean and std of the gaussian sizes
+        mean_and_std = torch.std_mean(sorted_sizes)
+ 
+        # Calculate outliers based on the std multiplied by the cull factor
+        outlier_range = (mean_and_std[0] * cull_std_factor) + mean_and_std[1]
+        max_gaussian_size = sorted_indices[sorted_sizes > outlier_range][0]
+        culled_gaussians = sorted_indices < max_gaussian_size
+
+        # Prune large Gaussians
+        self.gaussian.prune_points(culled_gaussians)
+
+        print(self.gaussian.get_scaling.shape)
+
+        exit(0)
+
+    def get_max_radius(self, radius_factor=1.3):
+       
+        with torch.no_grad():
+            positions = self.gaussian.get_xyz.clone()
+ 
+            euclid_distances = positions.pow(2).sum(1).sqrt()
+ 
+            return torch.absolute(torch.max(euclid_distances)) * radius_factor
+ 
     def configure_optimizers(self):
         self.parser = ArgumentParser(description="Training script parameters")
-        
+       
         opt = OptimizationParams(self.parser)
         point_cloud = self.pcb()
         self.cameras_extent = 4.0
         self.gaussian.create_from_pcd(point_cloud, self.cameras_extent)
-
+ 
         self.pipe = PipelineParams(self.parser)
         self.gaussian.training_setup(opt)
-
+ 
+        # Cull large Gaussians
+        self.cull_large_gaussians()
+ 
+        optimal_camera_distance = self.get_max_radius()
+       
+        print()
+        print()
+        print("!!!!!!!!!!!!!!!! OPTIMAL CAMERA DISTANCES !!!!!!!!!!!!!!!!")
+        print()
+        print("eval_camera_distance:")
+        print(optimal_camera_distance.item())
+        print()
+        print("camera_distance_range:")
+        print([(optimal_camera_distance - (optimal_camera_distance/10)).item(),
+               (optimal_camera_distance + (optimal_camera_distance/10)).item()])
+        print()
+        print()
+ 
         self.gaussian_copy = copy.deepcopy(self.gaussian)
-        
+ 
         ret = {
             "optimizer": self.gaussian.optimizer,
         }
-
+ 
         return ret
+ 
+        # Cull large Gaussians
+    def cull_large_gaussians(self, cull_std_factor=3):
+ 
+        # Calculate Gaussian Volumes
+        gaussian_sizes = torch.sum(self.gaussian.get_scaling, axis=1)
+ 
+        # Reoder Gaussians based on volume
+        sorted_sizes, sorted_indices = torch.sort(gaussian_sizes)
+ 
+        # Get the mean and std of the gaussian sizes
+        mean_and_std = torch.std_mean(sorted_sizes)
+ 
+        # Calculate outliers based on the std multiplied by the cull factor
+        outlier_range = (mean_and_std[0] * cull_std_factor) + mean_and_std[1]
+        max_gaussian_size = sorted_indices[sorted_sizes > outlier_range][0]
+        culled_gaussians = sorted_indices < max_gaussian_size
+       
+        # Prune large Gaussians
+        self.gaussian.prune_points(culled_gaussians)

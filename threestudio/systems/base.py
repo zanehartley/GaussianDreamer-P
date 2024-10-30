@@ -372,9 +372,9 @@ class BaseLift3DSystem(BaseSystem):
             + (
                 [
                     {
-                        "type": "rgb",
+                        "type": "grayscale",
                         "img": merge12(resize(guidance_eval_out["depth"])),
-                        "kwargs": {"data_format": "HWC"},
+                        "kwargs": {},
                     }
                 ]
             ),

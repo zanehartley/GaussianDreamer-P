@@ -73,7 +73,11 @@ class ControlnetGuidance(BaseObject):
             **pipe_kwargs,
         ).to(self.device)
 
+        lora_path = "/home/pszzh/Documents/diffuserstest/lora/output_bean/"
+        self.pipe.load_lora_weights(lora_path, weight_name="pytorch_lora_weights.safetensors")
 
+
+        self.noise = None
 
         if self.cfg.enable_memory_efficient_attention:
             if parse_version(torch.__version__) >= parse_version("2"):
@@ -220,8 +224,9 @@ class ControlnetGuidance(BaseObject):
                 elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
             )
             with torch.no_grad():
-                noise = torch.randn_like(latents)
-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
+                if (self.noise is None):
+                    self.noise = torch.randn_like(latents)
+                latents_noisy = self.scheduler.add_noise(latents, self.noise, t)
                 latent_model_input = torch.cat([latents_noisy] * 4, dim=0)
 
                 #depth_map = depths
@@ -268,8 +273,9 @@ class ControlnetGuidance(BaseObject):
             # predict the noise residual with unet, NO grad!
             with torch.no_grad():
                 # add noise
-                noise = torch.randn_like(latents)  # TODO: use torch generator
-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
+                if (self.noise is None):
+                    self.noise = torch.randn_like(latents)
+                latents_noisy = self.scheduler.add_noise(latents, self.noise, t)
                 # pred noise
                 latent_model_input = torch.cat([latents_noisy] * 2, dim=0)
                 
@@ -312,7 +318,7 @@ class ControlnetGuidance(BaseObject):
                 f"Unknown weighting strategy: {self.cfg.weighting_strategy}"
             )
 
-        grad = w * (noise_pred - noise)
+        grad = w * (noise_pred - self.noise)
 
         guidance_eval_utils = {
             "use_perp_neg": prompt_utils.use_perp_neg,
@@ -349,9 +355,10 @@ class ControlnetGuidance(BaseObject):
                 elevation, azimuth, camera_distances, self.cfg.view_dependent_prompting
             )
             with torch.no_grad():
-                noise = torch.randn_like(latents)
+                if (self.noise is None):
+                    self.noise = torch.randn_like(latents)
                 y = latents
-                zs = y + sigma * noise
+                zs = y + sigma * self.noise
                 scaled_zs = zs / torch.sqrt(1 + sigma**2)
                 # pred noise
                 latent_model_input = torch.cat([scaled_zs] * 4, dim=0)
@@ -401,10 +408,11 @@ class ControlnetGuidance(BaseObject):
             # predict the noise residual with unet, NO grad!
             with torch.no_grad():
                 # add noise
-                noise = torch.randn_like(latents)  # TODO: use torch generator
+                if (self.noise is None):
+                    self.noise = torch.randn_like(latents)
                 y = latents
 
-                zs = y + sigma * noise
+                zs = y + sigma * self.noise
                 scaled_zs = zs / torch.sqrt(1 + sigma**2)
 
                 # pred noise
@@ -725,7 +733,7 @@ class ControlnetGuidance(BaseObject):
         if self.cfg.grad_clip is not None:
             self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
 
-        self.set_min_max_steps(
-            min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
-            max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
-        )
+        #self.set_min_max_steps(
+        #    min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
+        #    max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
+        #)

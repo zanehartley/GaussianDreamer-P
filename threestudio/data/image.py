@@ -60,8 +60,11 @@ class SingleImageDataBase:
                 RandomCameraDataModuleConfig, self.cfg.get("random_camera", {})
             )
             if split == "train":
-                self.random_pose_generator = RandomCameraIterableDataset(
-                    random_camera_cfg
+                #self.random_pose_generator = RandomCameraIterableDataset(
+                #    random_camera_cfg
+                #)
+                self.random_pose_generator = RandomCameraDataset(
+                    random_camera_cfg, split
                 )
             else:
                 self.random_pose_generator = RandomCameraDataset(
